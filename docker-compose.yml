@@ -1,0 +1,26 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: tds-reco-backend
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: tds-reco-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    restart: unless-stopped

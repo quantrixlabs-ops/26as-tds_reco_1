@@ -56,6 +56,9 @@ export interface RecoResult {
   unmatched_books_count: number;
   avg_variance_pct: number;
   constraint_violations: number;
+  high_confidence_count: number;
+  medium_confidence_count: number;
+  cross_fy_match_count: number;
   matched_pairs: MatchedPair[];
   session_id: string;
 }

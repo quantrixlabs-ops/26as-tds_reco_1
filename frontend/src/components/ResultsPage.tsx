@@ -109,24 +109,49 @@ export default function ResultsPage({ result, cleaning, onReset }: Props) {
           color={result.constraint_violations === 0 ? 'green' : 'red'}
         />
         <StatCard
-          label="Rows Cleaned"
-          value={`${totalExcluded} of ${cleaning.total_rows_input}`}
-          sub={`${excludedPct}% removed`}
+          label="Variance Cap"
+          value="5%"
+          sub="Matches above 5% rejected"
+        />
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+        <StatCard
+          label="HIGH Confidence"
+          value={result.high_confidence_count}
+          sub="Variance ≤ 1%"
+          color="green"
+        />
+        <StatCard
+          label="MEDIUM Confidence"
+          value={result.medium_confidence_count}
+          sub="Variance 1–5%"
+          color="amber"
+        />
+        <StatCard
+          label="Unmatched 26AS"
+          value={result.unmatched_26as_count}
+          sub={result.unmatched_26as_count > 0 ? 'Best match exceeded 5% cap' : 'All matched ✓'}
+          color={result.unmatched_26as_count > 0 ? 'amber' : 'green'}
+        />
+        <StatCard
+          label="Cross-FY Matches"
+          value={result.cross_fy_match_count}
+          sub="SAP invoice from prior FY"
         />
       </div>
 
       <div className="grid grid-cols-2 gap-3 mb-6">
         <StatCard
-          label="Unmatched 26AS"
-          value={result.unmatched_26as_count}
-          sub={result.unmatched_26as_count > 0 ? 'Investigate with deductor' : 'All matched ✓'}
-          color={result.unmatched_26as_count > 0 ? 'amber' : 'green'}
-        />
-        <StatCard
           label="Unmatched Books"
           value={result.unmatched_books_count}
           sub={result.unmatched_books_count > 0 ? 'Advances or timing diff' : 'All matched ✓'}
           color={result.unmatched_books_count > 0 ? 'amber' : 'green'}
+        />
+        <StatCard
+          label="Rows Cleaned"
+          value={`${totalExcluded} of ${cleaning.total_rows_input}`}
+          sub={`${excludedPct}% removed`}
         />
       </div>
 

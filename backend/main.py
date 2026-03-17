@@ -24,7 +24,7 @@ from aligner import (
     store_session,
 )
 from cleaner import clean_sap_books
-from config import DEFAULT_FINANCIAL_YEAR, fy_date_range, fy_label_from_date_range
+from config import DEFAULT_FINANCIAL_YEAR, fy_date_range, fy_label_from_date_range, sap_date_window
 from excel_generator import generate_excel
 from models import (
     CleaningReport,
@@ -85,23 +85,28 @@ async def reconcile(
     # ── 1. Resolve FY date range ───────────────────────────────────────────
     try:
         fy_start, fy_end = fy_date_range(financial_year)
+        sap_start, sap_end = sap_date_window(financial_year)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     fy_label = financial_year  # e.g. "FY2023-24"
-    logger.info("Reconcile request: FY=%s (%s → %s)", fy_label, fy_start, fy_end)
+    logger.info(
+        "Reconcile request: FY=%s (%s → %s) | SAP window: %s → %s",
+        fy_label, fy_start, fy_end, sap_start, sap_end,
+    )
 
     # ── 2. Read files ──────────────────────────────────────────────────────
     sap_bytes  = await sap_file.read()
     as26_bytes = await as26_file.read()
     sap_filename = sap_file.filename or "upload.xlsx"
 
-    # ── 3. Clean SAP books (NO date filter — keep all invoice dates)
-    # Reason: SAP invoices are booked on invoice date, which may fall outside
-    # the FY (e.g. Mar invoice posted in Apr, or prior-year invoices appearing
-    # in 26AS). The FY filter applies to 26AS (government side) only.
+    # ── 3. Clean SAP books (P2: date window = current FY + 1 prior FY)
+    # Includes prior-FY invoices (TDS on old invoices appears in current 26AS)
+    # but EXCLUDES post-FY invoices (can't be paid before they exist).
     try:
-        clean_df, cleaning_report = clean_sap_books(sap_bytes)
+        clean_df, cleaning_report = clean_sap_books(
+            sap_bytes, fy_start=sap_start, fy_end=sap_end,
+        )
     except Exception as e:
         logger.exception("SAP cleaning failed")
         raise HTTPException(status_code=422, detail=f"SAP file parsing error: {e}")
@@ -110,8 +115,9 @@ async def reconcile(
         raise HTTPException(
             status_code=422,
             detail=(
-                "No valid RV/DC/DR invoice rows found after cleaning SAP file. "
-                "Check Document Type and amount columns."
+                f"No valid RV/DC/DR invoice rows found in SAP date window "
+                f"({sap_start.strftime('%d-%b-%Y')} – {sap_end.strftime('%d-%b-%Y')}). "
+                "Check Document Type, amounts, and date columns."
             ),
         )
 
@@ -267,6 +273,7 @@ def _run_and_respond(
         tan=tan,
         fuzzy_score=alignment.fuzzy_score,
         session_id=session_id,
+        target_fy=fy_label,
     )
 
     if cleaning_report is None:

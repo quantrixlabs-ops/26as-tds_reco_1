@@ -319,7 +319,7 @@ async def get_audit_trail(
             "description": l.description,
             "user_id": l.user_id,
             "created_at": l.created_at.isoformat(),
-            "metadata": l.metadata,
+            "metadata": l.event_metadata,
         }
         for l in result.scalars().all()
     ]

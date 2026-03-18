@@ -47,7 +47,7 @@ async def log_event(
         user_id=user_id,
         event_type=event_type,
         description=description,
-        metadata=metadata,
+        event_metadata=metadata,
         ip_address=ip_address,
         user_agent=user_agent,
         created_at=now,

@@ -43,7 +43,7 @@ class User(Base):
 
     # Relationships
     api_keys: Mapped[List["ApiKey"]] = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
-    runs: Mapped[List["ReconciliationRun"]] = relationship("ReconciliationRun", back_populates="created_by_user")
+    runs: Mapped[List["ReconciliationRun"]] = relationship("ReconciliationRun", foreign_keys="ReconciliationRun.created_by_id", back_populates="created_by_user")
     audit_logs: Mapped[List["AuditLog"]] = relationship("AuditLog", back_populates="user")
 
 
@@ -317,7 +317,7 @@ class AuditLog(Base):
     #      EXCEPTION_REVIEWED, FILE_UPLOADED, USER_LOGIN, EXPORT_DOWNLOADED
 
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # arbitrary extra data
+    event_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True, name="metadata")  # arbitrary extra data
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

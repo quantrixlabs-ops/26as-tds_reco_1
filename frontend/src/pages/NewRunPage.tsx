@@ -333,7 +333,7 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
   // Preview step state
   const [mappings, setMappings] = useState<BatchMapping[]>([]);
   const [allParties, setAllParties] = useState<BatchParty[]>([]);
-  const [overrides, setOverrides] = useState<Record<string, { deductor_name: string; tan: string }>>({});
+  const [overrides, setOverrides] = useState<Record<string, Array<{ deductor_name: string; tan: string }>>>({});
   const [openDropdown, setOpenDropdown] = useState<string | null>(null);
   const [dropdownSearch, setDropdownSearch] = useState('');
 
@@ -356,10 +356,10 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
       setMappings(result.mappings);
       setAllParties(result.all_parties);
       // Seed overrides from auto-confirmed
-      const seed: Record<string, { deductor_name: string; tan: string }> = {};
+      const seed: Record<string, Array<{ deductor_name: string; tan: string }>> = {};
       for (const m of result.mappings) {
         if (m.confirmed_name && m.confirmed_tan) {
-          seed[m.sap_filename] = { deductor_name: m.confirmed_name, tan: m.confirmed_tan };
+          seed[m.sap_filename] = [{ deductor_name: m.confirmed_name, tan: m.confirmed_tan }];
         }
       }
       setOverrides(seed);
@@ -373,16 +373,38 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
     }
   };
 
-  const setOverride = (filename: string, party: BatchParty) => {
-    setOverrides((prev) => ({ ...prev, [filename]: { deductor_name: party.deductor_name, tan: party.tan } }));
-    setOpenDropdown(null);
+  const toggleParty = (filename: string, party: BatchParty) => {
+    setOverrides((prev) => {
+      const current = prev[filename] ?? [];
+      const exists = current.some((p) => p.tan === party.tan && p.deductor_name === party.deductor_name);
+      const updated = exists
+        ? current.filter((p) => !(p.tan === party.tan && p.deductor_name === party.deductor_name))
+        : [...current, { deductor_name: party.deductor_name, tan: party.tan }];
+      if (updated.length === 0) {
+        const n = { ...prev };
+        delete n[filename];
+        return n;
+      }
+      return { ...prev, [filename]: updated };
+    });
   };
 
-  const clearOverride = (filename: string) => {
-    setOverrides((prev) => { const n = { ...prev }; delete n[filename]; return n; });
+  const removePartyChip = (filename: string, tan: string) => {
+    setOverrides((prev) => {
+      const updated = (prev[filename] ?? []).filter((p) => p.tan !== tan);
+      if (updated.length === 0) {
+        const n = { ...prev };
+        delete n[filename];
+        return n;
+      }
+      return { ...prev, [filename]: updated };
+    });
   };
 
-  const resolvedCount = mappings.filter((m) => !!overrides[m.sap_filename]).length;
+  const isPartySelected = (filename: string, party: BatchParty) =>
+    (overrides[filename] ?? []).some((p) => p.tan === party.tan && p.deductor_name === party.deductor_name);
+
+  const resolvedCount = mappings.filter((m) => (overrides[m.sap_filename] ?? []).length > 0).length;
   const needsReview = mappings.filter((m) => m.status !== 'AUTO_CONFIRMED').length;
 
   const handleRunAll = async () => {
@@ -390,7 +412,9 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
     setError(null);
     setSubmitting(true);
     try {
-      const result = await runsApi.batchRun(sapFiles, as26File, financialYear, overrides);
+      // Only pass files that have at least one party selected
+      const activeFiles = sapFiles.filter((f) => (overrides[f.name] ?? []).length > 0);
+      const result = await runsApi.batchRun(activeFiles, as26File, financialYear, overrides);
       const failed = result.runs.filter((r) => r.status === 'FAILED').length;
       if (failed > 0) {
         toast(
@@ -502,10 +526,7 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
 
         <div className="divide-y divide-gray-100">
           {mappings.map((m) => {
-            const override = overrides[m.sap_filename];
-            const displayName = override?.deductor_name ?? m.confirmed_name ?? '—';
-            const displayTan = override?.tan ?? m.confirmed_tan ?? '';
-            const isResolved = !!override;
+            const selectedParties = overrides[m.sap_filename] ?? [];
 
             return (
               <div key={m.sap_filename} className="px-4 py-3 flex items-start gap-3">
@@ -521,76 +542,105 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
                 {/* Arrow */}
                 <ChevronRight className="h-4 w-4 text-gray-300 mt-1 shrink-0" />
 
-                {/* Matched deductor + override dropdown */}
+                {/* Selected parties + multi-select dropdown */}
                 <div className="flex-1 min-w-0 relative">
-                  <div className="flex items-center gap-2 mb-1">
-                    <MappingStatusBadge status={isResolved ? 'AUTO_CONFIRMED' : m.status} score={m.fuzzy_score} />
-                  </div>
-                  <p className={cn('text-sm font-medium truncate', isResolved ? 'text-gray-900' : 'text-gray-400 italic')}>
-                    {displayName}
-                  </p>
-                  {displayTan && <p className="text-xs text-gray-400">{displayTan}</p>}
-
-                  {/* Override button */}
-                  <div className="mt-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next = openDropdown === m.sap_filename ? null : m.sap_filename;
-                        setOpenDropdown(next);
-                        setDropdownSearch('');
-                      }}
-                      className="text-xs text-[#1B3A5C] hover:underline"
-                    >
-                      {isResolved ? 'Change' : 'Select deductor'}
-                    </button>
-                    {isResolved && (
-                      <>
-                        {' · '}
-                        <button
-                          type="button"
-                          onClick={() => clearOverride(m.sap_filename)}
-                          className="text-xs text-red-500 hover:underline"
-                        >
-                          Clear
-                        </button>
-                      </>
+                  {/* Status badge */}
+                  <div className="flex items-center gap-2 mb-2">
+                    {selectedParties.length === 0 ? (
+                      <MappingStatusBadge status={m.status} score={m.fuzzy_score} />
+                    ) : selectedParties.length === 1 ? (
+                      <MappingStatusBadge status="AUTO_CONFIRMED" score={m.fuzzy_score} />
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                        <Layers className="h-3 w-3" /> {selectedParties.length} parties
+                      </span>
                     )}
                   </div>
 
-                  {/* Dropdown */}
+                  {/* Chips for selected parties */}
+                  {selectedParties.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mb-2">
+                      {selectedParties.map((p) => (
+                        <span
+                          key={p.tan}
+                          className="inline-flex items-center gap-1 bg-[#1B3A5C]/8 text-[#1B3A5C] text-xs font-medium px-2 py-1 rounded-lg border border-[#1B3A5C]/20"
+                        >
+                          <span className="truncate max-w-[140px]">{p.deductor_name}</span>
+                          <span className="text-[10px] text-gray-400 shrink-0">{p.tan}</span>
+                          <button
+                            type="button"
+                            onClick={() => removePartyChip(m.sap_filename, p.tan)}
+                            className="ml-0.5 text-gray-400 hover:text-red-500 transition-colors"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Open dropdown button */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = openDropdown === m.sap_filename ? null : m.sap_filename;
+                      setOpenDropdown(next);
+                      setDropdownSearch('');
+                    }}
+                    className="inline-flex items-center gap-1 text-xs text-[#1B3A5C] hover:underline font-medium"
+                  >
+                    {selectedParties.length === 0 ? '+ Select parties' : '+ Add party'}
+                    <ChevronDown className="h-3 w-3" />
+                  </button>
+
+                  {/* Multi-select dropdown */}
                   {openDropdown === m.sap_filename && (
-                    <div className="absolute left-0 top-full mt-1 z-30 w-72 bg-white border border-gray-200 rounded-xl shadow-xl overflow-hidden">
-                      {/* Search input */}
+                    <div className="absolute left-0 top-full mt-1 z-30 w-80 bg-white border border-gray-200 rounded-xl shadow-xl overflow-hidden">
+                      {/* Search */}
                       <div className="px-3 py-2 border-b border-gray-100">
                         <input
                           autoFocus
                           type="text"
-                          placeholder="Search deductor…"
+                          placeholder="Search deductor or TAN…"
                           value={dropdownSearch}
                           onChange={(e) => setDropdownSearch(e.target.value)}
                           className="w-full text-sm border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-[#1B3A5C] focus:ring-2 focus:ring-[#1B3A5C]/10 placeholder-gray-400"
                         />
                       </div>
-                      {/* Filtered list */}
-                      <div className="max-h-44 overflow-y-auto">
+                      {/* Checkbox list */}
+                      <div className="max-h-48 overflow-y-auto">
                         {allParties
                           .filter((p) =>
                             dropdownSearch === '' ||
                             p.deductor_name.toLowerCase().includes(dropdownSearch.toLowerCase()) ||
                             p.tan.toLowerCase().includes(dropdownSearch.toLowerCase()),
                           )
-                          .map((p) => (
-                            <button
-                              key={`${p.deductor_name}|${p.tan}`}
-                              type="button"
-                              onClick={() => setOverride(m.sap_filename, p)}
-                              className="w-full text-left px-3 py-2.5 text-sm hover:bg-blue-50 transition-colors border-b border-gray-50 last:border-0"
-                            >
-                              <p className="font-medium text-gray-800 truncate">{p.deductor_name}</p>
-                              <p className="text-xs text-gray-400">{p.tan} · {p.entry_count} entries</p>
-                            </button>
-                          ))}
+                          .map((p) => {
+                            const checked = isPartySelected(m.sap_filename, p);
+                            return (
+                              <button
+                                key={`${p.deductor_name}|${p.tan}`}
+                                type="button"
+                                onClick={() => toggleParty(m.sap_filename, p)}
+                                className={cn(
+                                  'w-full flex items-center gap-3 px-3 py-2.5 text-sm transition-colors border-b border-gray-50 last:border-0',
+                                  checked ? 'bg-blue-50' : 'hover:bg-gray-50',
+                                )}
+                              >
+                                {/* Checkbox */}
+                                <span className={cn(
+                                  'h-4 w-4 shrink-0 rounded border-2 flex items-center justify-center transition-colors',
+                                  checked ? 'bg-[#1B3A5C] border-[#1B3A5C]' : 'border-gray-300',
+                                )}>
+                                  {checked && <Check className="h-2.5 w-2.5 text-white" />}
+                                </span>
+                                <div className="flex-1 text-left min-w-0">
+                                  <p className="font-medium text-gray-800 truncate">{p.deductor_name}</p>
+                                  <p className="text-xs text-gray-400">{p.tan} · {p.entry_count} entries</p>
+                                </div>
+                              </button>
+                            );
+                          })}
                         {allParties.filter((p) =>
                           dropdownSearch === '' ||
                           p.deductor_name.toLowerCase().includes(dropdownSearch.toLowerCase()) ||
@@ -598,6 +648,19 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
                         ).length === 0 && (
                           <p className="px-3 py-4 text-sm text-gray-400 text-center">No match for "{dropdownSearch}"</p>
                         )}
+                      </div>
+                      {/* Done button */}
+                      <div className="px-3 py-2 border-t border-gray-100 bg-gray-50 flex items-center justify-between">
+                        <span className="text-xs text-gray-500">
+                          {selectedParties.length} selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setOpenDropdown(null)}
+                          className="text-xs font-semibold text-[#1B3A5C] hover:underline"
+                        >
+                          Done
+                        </button>
                       </div>
                     </div>
                   )}

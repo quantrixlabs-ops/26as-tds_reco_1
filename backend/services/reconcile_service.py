@@ -86,9 +86,13 @@ async def run_reconciliation(
     as26_filename: str,
     financial_year: str = DEFAULT_FINANCIAL_YEAR,
     batch_id: Optional[str] = None,
-    deductor_filter_name: Optional[str] = None,
-    deductor_filter_tan: Optional[str] = None,
+    deductor_filter_parties: Optional[List[dict]] = None,
 ) -> ReconciliationRun:
+    """
+    deductor_filter_parties: list of {deductor_name, tan} dicts.
+    When provided (batch mode), 26AS is filtered to only those parties
+    before matching — supporting multi-TAN / same-PAN scenarios.
+    """
     """
     Full reconciliation pipeline. Returns the persisted ReconciliationRun.
     """
@@ -135,11 +139,18 @@ async def run_reconciliation(
         # ── 4. Parse and validate 26AS ────────────────────────────────────────
         as26_df = parse_26as(as26_bytes)
 
-        # In batch mode, filter 26AS to the specific deductor for this SAP file
-        if deductor_filter_name and not as26_df.empty:
-            as26_df = as26_df[as26_df["deductor_name"] == deductor_filter_name].copy()
-        elif deductor_filter_tan and not as26_df.empty:
-            as26_df = as26_df[as26_df["tan"] == deductor_filter_tan].copy()
+        # In batch mode, filter 26AS to selected parties (OR of all entries)
+        if deductor_filter_parties and not as26_df.empty:
+            import numpy as np
+            mask = pd.Series([False] * len(as26_df), index=as26_df.index)
+            for party in deductor_filter_parties:
+                name = party.get("deductor_name", "")
+                tan = party.get("tan", "")
+                if name:
+                    mask = mask | (as26_df["deductor_name"] == name)
+                elif tan:
+                    mask = mask | (as26_df["tan"] == tan)
+            as26_df = as26_df[mask].copy()
 
         validated_df, val_report = validate_26as(as26_df)
 
@@ -179,7 +190,11 @@ async def run_reconciliation(
         # ── 8. Persist matched pairs ──────────────────────────────────────────
         deductor_name = ""
         tan = ""
-        if as26_entries:
+        if deductor_filter_parties and len(deductor_filter_parties) > 1:
+            names = [p["deductor_name"] for p in deductor_filter_parties if p.get("deductor_name")]
+            deductor_name = " + ".join(names)
+            tan = deductor_filter_parties[0].get("tan", "")
+        elif as26_entries:
             deductor_name = as26_entries[0].deductor_name
             tan = as26_entries[0].tan
 

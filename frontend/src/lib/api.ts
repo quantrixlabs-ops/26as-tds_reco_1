@@ -328,7 +328,7 @@ export const runsApi = {
     sapFiles: File[],
     as26File: File,
     financialYear: string,
-    mappings: Record<string, { deductor_name: string; tan: string }>,
+    mappings: Record<string, Array<{ deductor_name: string; tan: string }>>,
   ) => {
     const form = new FormData();
     form.append('as26_file', as26File);

@@ -419,9 +419,10 @@ async def create_batch_run(
             raise HTTPException(status_code=413, detail=f"{sap_file.filename} exceeds {settings.MAX_UPLOAD_MB}MB limit")
 
         filename = sap_file.filename or "sap.xlsx"
-        mapping = mappings.get(filename, {})
-        deductor_name = mapping.get("deductor_name") or None
-        deductor_tan = mapping.get("tan") or None
+        # mappings_json value is a list of {deductor_name, tan} dicts
+        parties: list = mappings.get(filename, [])
+        if isinstance(parties, dict):
+            parties = [parties]  # backward-compat: accept single dict too
 
         try:
             run = await run_reconciliation(
@@ -433,8 +434,7 @@ async def create_batch_run(
                 as26_filename=as26_file.filename or "26as.xlsx",
                 financial_year=financial_year,
                 batch_id=batch_id,
-                deductor_filter_name=deductor_name,
-                deductor_filter_tan=deductor_tan,
+                deductor_filter_parties=parties if parties else None,
             )
             runs_summary.append({
                 "run_id": run.id,

@@ -137,6 +137,9 @@ class ReconciliationRun(Base):
     has_section_mismatches: Mapped[bool] = mapped_column(Boolean, default=False)
     has_duplicate_26as: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Error message (set when status=FAILED)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Review workflow
     reviewed_by_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -169,6 +172,7 @@ class MatchedPair(Base):
     __table_args__ = (
         Index("ix_matched_pairs_run_id", "run_id"),
         Index("ix_matched_pairs_section", "section"),
+        UniqueConstraint("run_id", "as26_row_hash", name="uq_matched_pairs_run_hash"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -176,6 +180,7 @@ class MatchedPair(Base):
 
     # 26AS side
     as26_row_hash: Mapped[str] = mapped_column(String(64), nullable=False)  # SHA-256 of the raw 26AS row
+    as26_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     as26_amount: Mapped[float] = mapped_column(Float, nullable=False)
     as26_tds_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     as26_date: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
@@ -218,6 +223,7 @@ class MatchedPair(Base):
 
     # Remark — auto-generated when promoted from suggested match with high variance
     remark: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    alert_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -227,6 +233,10 @@ class MatchedPair(Base):
 class Unmatched26AS(Base):
     """26AS entries with no matching SAP invoice."""
     __tablename__ = "unmatched_26as"
+    __table_args__ = (
+        Index("ix_unmatched_26as_run_id", "run_id"),
+        UniqueConstraint("run_id", "as26_row_hash", name="uq_unmatched_26as_run_hash"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("reconciliation_runs.id", ondelete="CASCADE"), nullable=False)

@@ -120,9 +120,11 @@ class MatchConfig:
     date_hard_cutoff_days: int = 90
     date_soft_preference_days: int = 180
     enforce_books_before_26as: bool = True
+    filing_lag_days: int = 45  # Allow books up to N days AFTER 26AS date (filing lag tolerance)
 
     # Variance Thresholds
     variance_normal_ceiling_pct: float = 3.0
+    variance_auto_confirm_ceiling_pct: float = 20.0  # Auto-confirm matches up to this variance (with audit flag)
     variance_suggested_ceiling_pct: float = 20.0
 
     # Advance Payment

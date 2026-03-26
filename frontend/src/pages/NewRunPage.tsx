@@ -218,7 +218,7 @@ function MappingStatusBadge({ status, score }: { status: string; score: number |
 
 type SingleStep = 'upload' | 'mapping';
 
-function SingleUploadForm({ fyOptions }: { fyOptions: string[] }) {
+function SingleUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefault: string }) {
   const navigate = useNavigate();
   const { toast } = useToast();
 
@@ -228,7 +228,7 @@ function SingleUploadForm({ fyOptions }: { fyOptions: string[] }) {
   // Upload state
   const [sapFile, setSapFile] = useState<File | null>(null);
   const [as26File, setAs26File] = useState<File | null>(null);
-  const [financialYear, setFinancialYear] = useState(fyOptions[0] ?? '');
+  const [financialYear, setFinancialYear] = useState(fyDefault || (fyOptions[fyOptions.length - 1] ?? ''));
   const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -244,8 +244,8 @@ function SingleUploadForm({ fyOptions }: { fyOptions: string[] }) {
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    if (fyOptions.length && !financialYear) setFinancialYear(fyOptions[0]);
-  }, [fyOptions, financialYear]);
+    if (fyOptions.length && !financialYear) setFinancialYear(fyDefault || fyOptions[fyOptions.length - 1]);
+  }, [fyOptions, financialYear, fyDefault]);
 
   const canPreview = sapFile && as26File && financialYear && !previewing;
 
@@ -772,14 +772,14 @@ function BatchConfigStep({
   );
 }
 
-function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
+function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefault: string }) {
   const navigate = useNavigate();
   const { toast } = useToast();
 
   const [step, setStep] = useState<BatchStep>('upload');
   const [sapFiles, setSapFiles] = useState<File[]>([]);
   const [as26File, setAs26File] = useState<File | null>(null);
-  const [financialYear, setFinancialYear] = useState(fyOptions[0] ?? '');
+  const [financialYear, setFinancialYear] = useState(fyDefault || (fyOptions[fyOptions.length - 1] ?? ''));
 
   // Config step state
   const [batchConfig, setBatchConfig] = useState<Partial<AdminSettings> | null>(null);
@@ -796,9 +796,19 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Chunked batch progress
+  const [batchProgress, setBatchProgress] = useState<{
+    current: number;
+    total: number;
+    currentFile: string;
+    succeeded: number;
+    failed: number;
+    errors: Array<{ file: string; error: string }>;
+  } | null>(null);
+
   useEffect(() => {
-    if (fyOptions.length && !financialYear) setFinancialYear(fyOptions[0]);
-  }, [fyOptions, financialYear]);
+    if (fyOptions.length && !financialYear) setFinancialYear(fyDefault || fyOptions[fyOptions.length - 1]);
+  }, [fyOptions, financialYear, fyDefault]);
 
   const canPreview = sapFiles.length > 0 && as26File && financialYear && !previewing;
 
@@ -866,27 +876,52 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
     if (!as26File) return;
     setError(null);
     setSubmitting(true);
+
+    const activeFiles = sapFiles.filter((f) => (overrides[f.name] ?? []).length > 0);
+    const total = activeFiles.length;
+
+    setBatchProgress({ current: 0, total, currentFile: 'Initializing…', succeeded: 0, failed: 0, errors: [] });
+
     try {
-      // Only pass files that have at least one party selected
-      const activeFiles = sapFiles.filter((f) => (overrides[f.name] ?? []).length > 0);
-      const result = await runsApi.batchRun(activeFiles, as26File, financialYear, overrides, batchConfig);
-      const failed = result.runs.filter((r) => r.status === 'FAILED').length;
+      // Step 1: Upload 26AS and get batch session
+      const { batch_id } = await runsApi.batchInit(as26File, financialYear, batchConfig);
+
+      // Step 2: Upload each SAP file one-by-one
+      let succeeded = 0;
+      let failed = 0;
+      const errors: Array<{ file: string; error: string }> = [];
+
+      for (let i = 0; i < activeFiles.length; i++) {
+        const file = activeFiles[i];
+        const parties = overrides[file.name] ?? [];
+        setBatchProgress({ current: i + 1, total, currentFile: file.name, succeeded, failed, errors });
+
+        try {
+          await runsApi.batchAddParty(batch_id, file, parties);
+          succeeded++;
+        } catch (err) {
+          failed++;
+          errors.push({ file: file.name, error: getErrorMessage(err) });
+        }
+
+        setBatchProgress({ current: i + 1, total, currentFile: file.name, succeeded, failed, errors });
+      }
+
+      // Done
       if (failed > 0) {
-        toast(
-          'Batch complete with errors',
-          `${result.total - failed} succeeded, ${failed} failed`,
-          'error',
-        );
+        toast('Batch complete with errors', `${succeeded} succeeded, ${failed} failed`, 'error');
       } else {
-        toast('Batch complete', `${result.total} reconciliations finished`, 'success');
+        toast('Batch complete', `${succeeded} reconciliations submitted`, 'success');
       }
       navigate('/runs');
     } catch (err) {
+      // Init failed — nothing was submitted
       const msg = getErrorMessage(err);
       setError(msg);
-      toast('Batch run failed', msg, 'error');
+      toast('Batch init failed', msg, 'error');
     } finally {
       setSubmitting(false);
+      setBatchProgress(null);
     }
   };
 
@@ -1184,7 +1219,7 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
           )}
         >
           {submitting && <Spinner size="sm" className="border-white/30 border-t-white" />}
-          {submitting ? 'Running all…' : `Run All — ${resolvedCount} parties`}
+          {submitting ? `Uploading ${batchProgress?.current ?? 0}/${batchProgress?.total ?? resolvedCount}…` : `Run All — ${resolvedCount} parties`}
         </button>
         {resolvedCount < mappings.length && (
           <p className="text-xs text-amber-600">
@@ -1193,15 +1228,47 @@ function BatchUploadForm({ fyOptions }: { fyOptions: string[] }) {
         )}
       </div>
 
-      {submitting && (
-        <Card className="flex items-center gap-4">
-          <Spinner size="lg" />
-          <div>
-            <p className="text-sm font-semibold text-gray-900">Running batch reconciliation…</p>
-            <p className="text-xs text-gray-500 mt-0.5">
-              Processing {resolvedCount} parties sequentially. This may take 1–3 minutes.
-            </p>
+      {submitting && batchProgress && (
+        <Card className="space-y-4">
+          <div className="flex items-center gap-4">
+            <Spinner size="lg" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-gray-900">
+                Uploading file {batchProgress.current} of {batchProgress.total}
+              </p>
+              <p className="text-xs text-gray-500 mt-0.5 truncate">
+                {batchProgress.currentFile}
+              </p>
+            </div>
+            <div className="text-right shrink-0">
+              {batchProgress.succeeded > 0 && (
+                <span className="text-xs font-semibold text-emerald-600">{batchProgress.succeeded} ok</span>
+              )}
+              {batchProgress.failed > 0 && (
+                <span className="text-xs font-semibold text-red-600 ml-2">{batchProgress.failed} failed</span>
+              )}
+            </div>
           </div>
+
+          {/* Progress bar */}
+          <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
+            <div
+              className="h-full bg-[#1B3A5C] rounded-full transition-all duration-300"
+              style={{ width: `${batchProgress.total > 0 ? (batchProgress.current / batchProgress.total) * 100 : 0}%` }}
+            />
+          </div>
+
+          {/* Error list */}
+          {batchProgress.errors.length > 0 && (
+            <div className="space-y-1 max-h-32 overflow-y-auto">
+              {batchProgress.errors.map((e, i) => (
+                <div key={i} className="flex items-start gap-2 text-xs text-red-600 bg-red-50 rounded px-2 py-1.5">
+                  <AlertCircle className="h-3 w-3 shrink-0 mt-0.5" />
+                  <span className="truncate"><strong>{e.file}:</strong> {e.error}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
       )}
     </div>
@@ -1221,6 +1288,7 @@ export default function NewRunPage() {
   });
 
   const fyOptions = fyData?.years ?? [];
+  const fyDefault = fyData?.default ?? fyOptions[fyOptions.length - 1] ?? '';
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -1275,9 +1343,9 @@ export default function NewRunPage() {
 
       {/* Form */}
       {mode === 'single' ? (
-        <SingleUploadForm fyOptions={fyOptions} />
+        <SingleUploadForm fyOptions={fyOptions} fyDefault={fyDefault} />
       ) : (
-        <BatchUploadForm fyOptions={fyOptions} />
+        <BatchUploadForm fyOptions={fyOptions} fyDefault={fyDefault} />
       )}
     </div>
   );

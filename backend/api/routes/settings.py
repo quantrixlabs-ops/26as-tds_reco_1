@@ -45,7 +45,7 @@ class AdminSettingsSchema(BaseModel):
 
 
 class AdminSettingsUpdate(BaseModel):
-    """Update schema — all fields optional (partial update)."""
+    """Update schema — all fields optional (partial update) with validation."""
     doc_types_include: Optional[list[str]] = None
     doc_types_exclude: Optional[list[str]] = None
     date_hard_cutoff_days: Optional[int] = None
@@ -60,6 +60,44 @@ class AdminSettingsUpdate(BaseModel):
     cross_fy_lookback_years: Optional[int] = None
     force_match_enabled: Optional[bool] = None
     noise_threshold: Optional[float] = None
+
+    from pydantic import field_validator
+
+    @field_validator(
+        "date_hard_cutoff_days", "date_soft_preference_days",
+        "max_combo_size", "cross_fy_lookback_years",
+        mode="before",
+    )
+    @classmethod
+    def _non_negative_int(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Value must be non-negative")
+        return v
+
+    @field_validator(
+        "variance_normal_ceiling_pct", "variance_suggested_ceiling_pct",
+        "noise_threshold",
+        mode="before",
+    )
+    @classmethod
+    def _non_negative_float(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Value must be non-negative")
+        return v
+
+    @field_validator("variance_normal_ceiling_pct", "variance_suggested_ceiling_pct", mode="before")
+    @classmethod
+    def _pct_max_100(cls, v):
+        if v is not None and v > 100:
+            raise ValueError("Percentage cannot exceed 100")
+        return v
+
+    @field_validator("cross_fy_lookback_years", mode="before")
+    @classmethod
+    def _lookback_range(cls, v):
+        if v is not None and v > 5:
+            raise ValueError("Lookback years cannot exceed 5")
+        return v
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

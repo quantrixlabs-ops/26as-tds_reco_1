@@ -41,7 +41,14 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 from engine.scorer import score_candidate, BookCandidate, ScoreBreakdown, _parse_date
-from config import MAX_COMBO_SIZE, MatchConfig
+from config import (
+    MAX_COMBO_SIZE,
+    VARIANCE_CAP_SINGLE,
+    VARIANCE_CAP_FORCE_SINGLE,
+    FORCE_COMBO_MAX_INVOICES,
+    FORCE_COMBO_MAX_VARIANCE,
+    MatchConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,13 +118,20 @@ def _is_date_eligible(days_gap: Optional[int], cfg: MatchConfig) -> Tuple[bool, 
 
     - Within hard cutoff (default 90 days): eligible, category=""
     - Between hard and soft (default 90-180): eligible, category="DATE_SOFT_PREFERENCE"
-    - Books AFTER 26AS date (negative gap) when enforce_books_before_26as=True: ineligible
+    - Books AFTER 26AS date (negative gap):
+        * Within filing_lag_days (default 45): eligible, category="DATE_SOFT_PREFERENCE"
+        * Beyond filing_lag_days: ineligible
     - Beyond soft cutoff (>180): ineligible
     """
     if days_gap is None:
         return True, ""  # no date info, don't exclude
-    if cfg.enforce_books_before_26as and days_gap < 0:
-        return False, ""  # book is after 26AS
+    if days_gap < 0:
+        # Book is AFTER 26AS — allow within filing lag tolerance
+        filing_lag = getattr(cfg, 'filing_lag_days', 45)
+        if abs(days_gap) <= filing_lag:
+            return True, "DATE_SOFT_PREFERENCE"
+        if cfg.enforce_books_before_26as:
+            return False, ""
     abs_gap = abs(days_gap)
     if abs_gap <= cfg.date_hard_cutoff_days:
         return True, ""
@@ -214,6 +228,46 @@ def run_global_optimizer(
     )
     all_results.extend(phase_b_results)
 
+    # ── Phase B.2: Relaxed Individual Matching ────────────────────────────────
+    # Retry unmatched entries with relaxed parameters: wider date window (180 days),
+    # and slightly relaxed variance. Catches near-misses that Phase B's strict criteria missed.
+    if phase_b_unmatched:
+        logger.info("optimizer.phase_b2_start")
+        _progress("PHASE_B2", 0, len(phase_b_unmatched), _count_normal(all_results),
+                  f"Relaxed matching {len(phase_b_unmatched)} entries...")
+
+        # Build a relaxed config: wider date hard cutoff, same auto-confirm ceiling
+        relaxed_cfg = MatchConfig(
+            date_hard_cutoff_days=cfg.date_soft_preference_days,  # promote soft to hard (180 days)
+            date_soft_preference_days=365,  # allow up to 1 year as soft
+            enforce_books_before_26as=False,  # allow books after 26AS in relaxed pass
+            filing_lag_days=getattr(cfg, 'filing_lag_days', 45),
+            variance_normal_ceiling_pct=cfg.variance_normal_ceiling_pct,
+            variance_auto_confirm_ceiling_pct=getattr(cfg, 'variance_auto_confirm_ceiling_pct', cfg.variance_suggested_ceiling_pct),
+            variance_suggested_ceiling_pct=cfg.variance_suggested_ceiling_pct,
+            max_combo_size=cfg.max_combo_size,
+            combo_pool_cap=cfg.combo_pool_cap,
+            combo_iteration_budget=cfg.combo_iteration_budget,
+            exact_tolerance=cfg.exact_tolerance,
+            date_clustering_preference=cfg.date_clustering_preference,
+        )
+        phase_b2_results, phase_b2_unmatched = _phase_b_global(
+            phase_b_unmatched, active_books, used_book_indices, consumed_invoice_refs, relaxed_cfg
+        )
+        # Tag relaxed matches for audit trail
+        for r in phase_b2_results:
+            if not r.suggested:
+                r.alert_message = f"Matched in relaxed pass (Phase B.2): {r.match_type}"
+                if r.variance_pct > cfg.variance_normal_ceiling_pct:
+                    r.ai_risk_flag = True
+                    r.ai_risk_reason = f"Relaxed match at {r.variance_pct:.1f}% variance"
+        all_results.extend(phase_b2_results)
+        _progress("PHASE_B2", len(phase_b_unmatched), len(phase_b_unmatched),
+                  _count_normal(all_results),
+                  f"Relaxed done: {_count_normal(phase_b2_results)} matched, "
+                  f"{_count_suggested(phase_b2_results)} suggested")
+        phase_b_unmatched = phase_b2_unmatched
+
     # ── Phase C: Force match (all -> suggested) ──────────────────────────────
     if cfg.force_match_enabled:
         logger.info("optimizer.phase_c_start")
@@ -241,9 +295,17 @@ def run_global_optimizer(
             r.is_prior_year = True
             r.cross_fy = True
             r.match_type = f"PRIOR_{r.match_type}"
-            r.confidence = "LOW"
             r.suggested = True
             r.suggested_category = "CROSS_FY"
+            # Boundary-zone exception: if 26AS date is within 60 days of FY boundary
+            # (April 1 or March 31), treat as MEDIUM confidence instead of LOW
+            is_boundary = _is_fy_boundary_zone(r.as26_date, days=60)
+            r.confidence = "MEDIUM" if is_boundary else "LOW"
+            if is_boundary:
+                r.alert_message = (
+                    f"Cross-FY match in boundary zone (within 60 days of FY boundary). "
+                    f"{r.alert_message or ''}"
+                ).strip()
         all_results.extend(phase_e_results)
         unmatched = phase_e_unmatched
         _progress("PHASE_E", len(phase_c_unmatched), len(phase_c_unmatched),
@@ -252,17 +314,24 @@ def run_global_optimizer(
     else:
         unmatched = phase_c_unmatched
 
-    # ── SGL_V advance payment books -> suggested ─────────────────────────────
-    if sgl_v_books and not cfg.exclude_sgl_v:
+    # ── Phase B.3: SGL_V advance payment books -> suggested ─────────────────
+    # Always try SGL_V books as last resort for unmatched entries (all go to suggested)
+    if sgl_v_books and unmatched:
+        logger.info("optimizer.phase_b3_start")
+        _progress("PHASE_B3", 0, len(unmatched), _count_normal(all_results),
+                  f"Advance TDS matching {len(unmatched)} entries against {len(sgl_v_books)} SGL_V books...")
         adv_results, adv_unmatched = _phase_b_global(
             unmatched, sgl_v_books, used_book_indices, consumed_invoice_refs, cfg
         )
         for r in adv_results:
             r.suggested = True
             r.suggested_category = "ADVANCE_PAYMENT"
-            r.alert_message = "Matched against advance payment (SGL_V)"
+            r.alert_message = "Matched against advance payment (SGL_V) — CA review required"
+            r.confidence = "LOW"
         all_results.extend(adv_results)
         unmatched = adv_unmatched
+        _progress("PHASE_B3", len(unmatched), len(unmatched), _count_normal(all_results),
+                  f"Advance TDS done: {len(adv_results)} suggested")
 
     # ── Post-run compliance validation ────────────────────────────────────────
     _progress("POST_VALIDATE", 0, 1, _count_normal(all_results), "Running compliance checks...")
@@ -372,13 +441,124 @@ def _phase_a_clearing_groups(
                 match_type=f"CLR_GROUP_{len(books)}",
                 variance_pct=round(var_pct, 4),
                 variance_amt=round(target - sum(b.amount for b in books), 2),
-                confidence=_confidence(var_pct, "CLR_GROUP"),
+                confidence=_confidence(var_pct, "CLR_GROUP", score),
                 score=score,
             ))
         else:
             unmatched_26as.append(as26)
 
+    # ── Proxy clearing groups (fallback when clearing_doc is sparse) ────────
+    # If Phase A matched very few entries, try date+amount clustering as proxy groups
+    clr_coverage = len(matched) / len(as26_entries) if as26_entries else 1.0
+    if clr_coverage < 0.1 and len(unmatched_26as) >= 2:
+        proxy_matched, proxy_unmatched = _proxy_clearing_groups(
+            unmatched_26as, book_pool, used_book_indices, consumed_invoice_refs, cfg
+        )
+        matched.extend(proxy_matched)
+        unmatched_26as = proxy_unmatched
+
     return matched, unmatched_26as
+
+
+def _proxy_clearing_groups(
+    as26_entries: List[As26Entry],
+    book_pool: List[BookEntry],
+    used_book_indices: Set[int],
+    consumed_invoice_refs: Set[int],
+    cfg: MatchConfig,
+) -> Tuple[List[AssignmentResult], List[As26Entry]]:
+    """Fallback: cluster books by date proximity to form proxy clearing groups.
+    When clearing_doc is missing/sparse, books with same doc_date and amounts
+    that sum close to a 26AS entry form a pseudo-group."""
+    from collections import defaultdict
+
+    excluded = used_book_indices | consumed_invoice_refs
+    max_grp = cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE
+    clr_cap = cfg.variance_normal_ceiling_pct
+
+    # Cluster available books by doc_date
+    date_groups: Dict[str, List[BookEntry]] = defaultdict(list)
+    for b in book_pool:
+        if b.index in excluded or not b.doc_date:
+            continue
+        date_groups[b.doc_date].append(b)
+
+    # Only consider date clusters with 2-max_grp entries
+    valid_date_groups = {d: books for d, books in date_groups.items()
+                         if 2 <= len(books) <= max_grp}
+
+    matched: List[AssignmentResult] = []
+    unmatched: List[As26Entry] = []
+
+    for as26 in as26_entries:
+        target = as26.amount
+        best_result = None
+        best_score = -1.0
+
+        for doc_date, group in valid_date_groups.items():
+            avail = [b for b in group if b.index not in excluded]
+            if len(avail) < 2:
+                continue
+
+            group_sum = sum(b.amount for b in avail)
+            if group_sum > target + cfg.exact_tolerance:
+                # Try subset of the date group
+                avail_sorted = sorted(avail, key=lambda b: b.amount, reverse=True)
+                subset = []
+                sub_sum = 0.0
+                for b in avail_sorted:
+                    if sub_sum + b.amount <= target + cfg.exact_tolerance:
+                        subset.append(b)
+                        sub_sum += b.amount
+                    if len(subset) >= max_grp:
+                        break
+                if len(subset) < 2:
+                    continue
+                avail = subset
+                group_sum = sub_sum
+
+            if group_sum > target + cfg.exact_tolerance:
+                continue
+
+            var_pct = (target - group_sum) / target * 100 if target > 0 else 100.0
+            if var_pct > clr_cap:
+                continue
+
+            candidate = BookCandidate(
+                invoice_refs=[b.invoice_ref for b in avail],
+                amounts=[b.amount for b in avail],
+                dates=[b.doc_date for b in avail],
+                clearing_doc=None,
+                sap_fy=avail[0].sap_fy,
+            )
+            score = score_candidate(target, as26.transaction_date, as26.section, candidate,
+                                     enforce_before=cfg.enforce_books_before_26as)
+            if score.total > best_score:
+                best_score = score.total
+                best_result = (avail, score, var_pct)
+
+        if best_result:
+            books, score, var_pct = best_result
+            _commit(books, used_book_indices, consumed_invoice_refs)
+            for b in books:
+                excluded.add(b.index)
+            matched.append(AssignmentResult(
+                as26_index=as26.index,
+                as26_amount=target,
+                as26_date=as26.transaction_date,
+                as26_section=as26.section,
+                books=books,
+                match_type=f"PROXY_GROUP_{len(books)}",
+                variance_pct=round(var_pct, 4),
+                variance_amt=round(target - sum(b.amount for b in books), 2),
+                confidence=_confidence(var_pct, "PROXY_GROUP", score),
+                score=score,
+                alert_message="Matched via date-clustered proxy group (no clearing doc)",
+            ))
+        else:
+            unmatched.append(as26)
+
+    return matched, unmatched
 
 
 # ── Phase B: Bipartite + Smart Combo ─────────────────────────────────────────
@@ -413,12 +593,18 @@ def _phase_b_global(
               f"Built {len(all_candidates)} single candidates. Running bipartite...")
 
     # Split: normal candidates (for bipartite) vs suggested candidates
+    # Auto-confirm ceiling: entries up to this variance go through bipartite (auto-confirmed)
+    # Only entries above this ceiling become suggested
+    auto_confirm_cap = getattr(cfg, 'variance_auto_confirm_ceiling_pct', cfg.variance_suggested_ceiling_pct)
     normal_candidates: Dict[Tuple[int, int], Tuple] = {}
     soft_candidates: Dict[Tuple[int, int], Tuple] = {}
 
     for key, val in all_candidates.items():
         score_val, var_pct, match_type, score_obj, book, date_cat, alert, days_gap = val
-        if var_pct <= cfg.variance_normal_ceiling_pct and date_cat == "":
+        # Route to bipartite if within auto-confirm ceiling
+        # Categories: "" (normal), "HIGH_VARIANCE_3_20", "DATE_SOFT_PREFERENCE" all go to bipartite
+        # Only "HIGH_VARIANCE_20_PLUS" or above ceiling goes to suggested
+        if var_pct <= auto_confirm_cap:
             normal_candidates[key] = val
         else:
             soft_candidates[key] = val
@@ -435,6 +621,16 @@ def _phase_b_global(
         )
     else:
         bip_matched, bip_unmatched, bip_used = [], list(as26_entries), set()
+
+    # Flag auto-confirmed high-variance matches (above normal ceiling but within auto-confirm)
+    for r in bip_matched:
+        if r.variance_pct > cfg.variance_normal_ceiling_pct:
+            r.alert_message = (
+                f"Auto-confirmed at {r.variance_pct:.1f}% variance "
+                f"(above {cfg.variance_normal_ceiling_pct}% normal ceiling)"
+            )
+            r.ai_risk_flag = True
+            r.ai_risk_reason = f"High variance auto-confirmed: {r.variance_pct:.1f}%"
 
     results: List[AssignmentResult] = list(bip_matched)
     used_book_indices.update(bip_used)
@@ -496,11 +692,11 @@ def _phase_b_global(
     # Merge suggested into results
     results.extend(suggested)
 
-    # Collect truly unmatched
+    # Collect truly unmatched (entries not in any result — matched, suggested, or combo)
     all_handled = {r.as26_index for r in results}
     truly_unmatched = [e for e in as26_entries if e.index not in all_handled]
 
-    return results, truly_unmatched + final_unmatched
+    return results, truly_unmatched
 
 
 def _build_single_candidates(
@@ -562,7 +758,7 @@ def _build_single_candidates(
 
             var_pct = (target - b.amount) / target * 100
             if var_pct < 0:
-                var_pct = abs(var_pct)  # shouldn't happen due to amount filter, safety
+                continue  # books > target = Section 199 violation, skip
 
             match_type = "EXACT" if var_pct <= exact_threshold else "SINGLE"
 
@@ -650,7 +846,7 @@ def _bipartite_match(
             match_type=match_type,
             variance_pct=round(var_pct, 4),
             variance_amt=round(as26.amount - book.amount, 2),
-            confidence=_confidence(var_pct, match_type),
+            confidence=_confidence(var_pct, match_type, score_obj),
             score=score_obj,
             days_gap=days_gap,
         ))
@@ -693,7 +889,7 @@ def _greedy_single(
             books=[book], match_type=match_type,
             variance_pct=round(var_pct, 4),
             variance_amt=round(as26.amount - book.amount, 2),
-            confidence=_confidence(var_pct, match_type), score=score_obj,
+            confidence=_confidence(var_pct, match_type, score_obj), score=score_obj,
             days_gap=days_gap,
         ))
 
@@ -713,17 +909,31 @@ def _smart_combo_match(
     """
     Date-clustered combo matching using greedy accumulation + subset-sum DP.
     Returns (results, unmatched) where results may include both normal and suggested.
+    Hard timeout guard: if combo matching takes too long, bail out gracefully.
     """
+    import time
+    COMBO_TIMEOUT_SECONDS = 30  # Hard cap — prevent runaway combo matching
+
     results: List[AssignmentResult] = []
     unmatched: List[As26Entry] = []
 
     excluded = set(used_book_indices) | set(consumed_invoice_refs)
+    combo_start_time = time.monotonic()
 
     # Pre-sort book pool by amount once for bisect lookups
     sorted_books = sorted(book_pool, key=lambda b: b.amount)
     sorted_amounts = [b.amount for b in sorted_books]
 
     for as26 in as26_entries:
+        # Timeout guard: if combo matching exceeded time budget, route remaining to unmatched
+        if time.monotonic() - combo_start_time > COMBO_TIMEOUT_SECONDS:
+            logger.warning(f"Combo timeout after {COMBO_TIMEOUT_SECONDS}s — "
+                           f"{len(as26_entries) - len(results) - len(unmatched)} entries skipped")
+            unmatched.extend(e for e in as26_entries
+                             if e.index not in {r.as26_index for r in results}
+                             and e not in unmatched)
+            break
+
         target = as26.amount
         tol = target + cfg.exact_tolerance
         a_date = as26.transaction_date
@@ -803,8 +1013,9 @@ def _smart_combo_match(
                 alert = "Contains invoices 90-180 days from 26AS date"
 
             # Route based on variance and date category
-            is_suggested = (var_pct > cfg.variance_normal_ceiling_pct
-                            or worst_date_cat == "DATE_SOFT_PREFERENCE")
+            # Auto-confirm up to auto_confirm_ceiling; only route to suggested above that
+            _auto_cap = getattr(cfg, 'variance_auto_confirm_ceiling_pct', cfg.variance_suggested_ceiling_pct)
+            is_suggested = var_pct > _auto_cap
 
             if is_suggested:
                 cat, req_remarks = _categorize_suggested(var_pct, worst_date_cat, cfg)
@@ -829,9 +1040,17 @@ def _smart_combo_match(
                     books=books, match_type=match_type,
                     variance_pct=round(var_pct, 4),
                     variance_amt=round(target - books_sum, 2),
-                    confidence=_confidence(var_pct, match_type),
+                    confidence=_confidence(var_pct, match_type, score_obj),
                     score=score_obj,
                 )
+                # Flag auto-confirmed high-variance combos
+                if var_pct > cfg.variance_normal_ceiling_pct:
+                    result.alert_message = (
+                        f"Auto-confirmed combo at {var_pct:.1f}% variance "
+                        f"(above {cfg.variance_normal_ceiling_pct}% normal ceiling)"
+                    )
+                    result.ai_risk_flag = True
+                    result.ai_risk_reason = f"High variance auto-confirmed: {var_pct:.1f}%"
                 _commit(books, used_book_indices, consumed_invoice_refs)
                 for b in books:
                     excluded.add(b.index)
@@ -1029,20 +1248,25 @@ def _force_match_one(
         eligible.sort(key=lambda x: abs(x[1]))
     eligible = eligible[:cfg.combo_pool_cap]
 
-    max_size = cfg.max_combo_size if cfg.max_combo_size > 0 else len(eligible)
+    # Force combos limited to FORCE_COMBO_MAX_INVOICES (3) per Brief §3/#3
+    max_size_combo = min(
+        cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE,
+        FORCE_COMBO_MAX_INVOICES,
+    )
 
-    # Try greedy accumulation first (allows single + combo)
-    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size)
+    # Try greedy accumulation first (allows single + combo, capped at max_size_combo)
+    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size_combo)
     if best_result is None:
         amounts = [b.amount for b, _, _ in eligible]
-        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size)
+        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size_combo)
         if dp_indices is not None:
             best_result = [eligible[idx] for idx in dp_indices]
 
     # Also try single best match (greedy may have skipped it)
+    # Enforce FORCE_SINGLE 5% variance cap here (Brief §3/#4)
     if best_result is None and eligible:
         best_single = None
-        best_single_var = 100.0
+        best_single_var = VARIANCE_CAP_FORCE_SINGLE  # Cap at 5%, not 100%
         for b, dg, dc in eligible:
             if b.amount <= target + cfg.exact_tolerance:
                 var = (target - b.amount) / target * 100 if target > 0 else 100.0
@@ -1055,6 +1279,16 @@ def _force_match_one(
     if not best_result:
         return None, True
 
+    # Deduplicate books by index (same SAP row cannot appear twice in one match)
+    seen_indices: Set[int] = set()
+    deduped: List[Tuple] = []
+    for item in best_result:
+        b = item[0]
+        if b.index not in seen_indices:
+            seen_indices.add(b.index)
+            deduped.append(item)
+    best_result = deduped
+
     books = [b for b, _, _ in best_result]
     books_sum = sum(b.amount for b in books)
     var_pct = (target - books_sum) / target * 100 if target > 0 else 100.0
@@ -1063,6 +1297,18 @@ def _force_match_one(
         return None, True  # Section 199 violation
 
     combo_size = len(books)
+
+    # ── Enforce tier-specific force-match caps (Brief §3/#3 and §3/#4) ────
+    if combo_size == 1:
+        # FORCE_SINGLE: reject if variance exceeds 5% cap
+        if var_pct > VARIANCE_CAP_FORCE_SINGLE:
+            return None, True
+    else:
+        # FORCE_COMBO: reject if >3 invoices or >2% variance
+        if combo_size > FORCE_COMBO_MAX_INVOICES:
+            return None, True
+        if var_pct > FORCE_COMBO_MAX_VARIANCE:
+            return None, True
 
     clr_docs = set(b.clearing_doc for b in books)
     clr_doc = books[0].clearing_doc if len(clr_docs) == 1 else None
@@ -1113,6 +1359,8 @@ def _force_match_chunk(
             unmatched.append(as26)
         elif result:
             suggested.append(result)
+        else:
+            unmatched.append(as26)
     return suggested, unmatched
 
 
@@ -1147,54 +1395,35 @@ def _phase_c_force_unified(
     total = len(as26_entries)
     _progress = lambda done, detail: progress_cb("PHASE_C", done, total, matched_so_far, detail) if progress_cb else None
 
-    # Parallel execution when enough entries to justify the overhead
-    PARALLEL_THRESHOLD = 200
-    import os
-    num_workers = min(os.cpu_count() or 1, 4)
+    # ── Sequential only — parallel was reusing same books across workers ──
+    # Invoice reuse prevention requires sequential processing: after each
+    # FORCE match, the consumed books must be removed from the pool before
+    # the next 26AS entry is attempted.
+    suggested: List[AssignmentResult] = []
+    unmatched: List[As26Entry] = []
+    consumed_indices: Set[int] = set()
+    progress_interval = max(1, total // 20)
 
-    if total >= PARALLEL_THRESHOLD and num_workers > 1:
-        import concurrent.futures
-        _progress(0, f"Force-matching {total} entries across {num_workers} workers...")
+    for i, as26 in enumerate(as26_entries):
+        if progress_cb and i % progress_interval == 0:
+            _progress(i, f"Force-matching entry {i + 1}/{total}...")
 
-        chunk_size = max(1, total // num_workers)
-        chunks = [as26_entries[i:i + chunk_size] for i in range(0, total, chunk_size)]
+        result, is_unmatched = _force_match_one(as26, available, avail_amounts, cfg)
+        if is_unmatched:
+            unmatched.append(as26)
+        elif result:
+            # ── Remove consumed books from pool to prevent reuse ──
+            matched_indices = {b.index for b in result.books}
+            consumed_indices.update(matched_indices)
+            available = [b for b in available if b.index not in consumed_indices]
+            avail_amounts = [b.amount for b in available]
+            suggested.append(result)
+        else:
+            # Defensive: result is None but not flagged as unmatched — treat as unmatched
+            unmatched.append(as26)
 
-        suggested: List[AssignmentResult] = []
-        unmatched: List[As26Entry] = []
-
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(_force_match_chunk, chunk, available, avail_amounts, cfg): i
-                for i, chunk in enumerate(chunks)
-            }
-            done_count = 0
-            for future in concurrent.futures.as_completed(futures):
-                chunk_suggested, chunk_unmatched = future.result()
-                suggested.extend(chunk_suggested)
-                unmatched.extend(chunk_unmatched)
-                done_count += len(chunk_suggested) + len(chunk_unmatched)
-                _progress(done_count, f"Force-matched {done_count}/{total} entries...")
-
-        _progress(total, f"Force matching done: {len(suggested)} suggested")
-        return suggested, unmatched
-    else:
-        # Sequential path (small datasets or single core)
-        suggested: List[AssignmentResult] = []
-        unmatched: List[As26Entry] = []
-        progress_interval = max(1, total // 20)
-
-        for i, as26 in enumerate(as26_entries):
-            if progress_cb and i % progress_interval == 0:
-                _progress(i, f"Force-matching entry {i + 1}/{total}...")
-
-            result, is_unmatched = _force_match_one(as26, available, avail_amounts, cfg)
-            if is_unmatched:
-                unmatched.append(as26)
-            elif result:
-                suggested.append(result)
-
-        _progress(total, f"Force matching done: {len(suggested)} suggested")
-        return suggested, unmatched
+    _progress(total, f"Force matching done: {len(suggested)} suggested")
+    return suggested, unmatched
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1212,12 +1441,42 @@ def _variance_pct(as26_amt: float, books_sum: float) -> float:
     return (as26_amt - books_sum) / as26_amt * 100
 
 
-def _confidence(variance_pct: float, match_type: str) -> str:
+def _is_fy_boundary_zone(date_str: Optional[str], days: int = 60) -> bool:
+    """Check if a date falls within N days of the FY boundary (March 31 / April 1)."""
+    d = _parse_date(date_str)
+    if d is None:
+        return False
+    # Distance to nearest March 31
+    year = d.year
+    from datetime import date as _date
+    boundaries = [_date(year, 3, 31), _date(year, 4, 1),
+                  _date(year - 1, 3, 31), _date(year + 1, 3, 31)]
+    return any(abs((d - b).days) <= days for b in boundaries)
+
+
+def _confidence(variance_pct: float, match_type: str, score: Optional[ScoreBreakdown] = None) -> str:
+    """Determine confidence tier from variance, match type, and composite score.
+
+    Tiers:
+        HIGH:   exact/near-exact (≤1%), non-force, OR high composite score (≥70) with ≤2%
+        MEDIUM: 1–5% variance non-force, OR composite score ≥50
+        LOW:    FORCE, PRIOR, PROXY, or high variance (>5%)
+    """
     if "FORCE" in match_type or "PRIOR" in match_type:
         return "LOW"
+    if "PROXY" in match_type:
+        return "MEDIUM" if variance_pct <= 1.0 else "LOW"
+    # Use composite score to boost confidence when available
+    composite = score.total if score else 0.0
     if variance_pct <= 1.0:
         return "HIGH"
-    return "MEDIUM"
+    if variance_pct <= 2.0 and composite >= 70.0:
+        return "HIGH"
+    if variance_pct <= 5.0:
+        return "MEDIUM"
+    if composite >= 50.0:
+        return "MEDIUM"
+    return "LOW"
 
 
 def _validate_compliance(

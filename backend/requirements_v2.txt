@@ -29,7 +29,7 @@ rapidfuzz==3.10.1
 # ── Optimization engine ────────────────────────────────────────────────────────
 scipy==1.13.1              # Bipartite matching (linear_sum_assignment)
 networkx==3.2.1            # Graph algorithms
-PuLP==2.9.0                # ILP solver (CBC bundled)
+# PuLP==2.9.0              # REMOVED: unused — engine uses scipy bipartite + greedy, not ILP
 
 # ── Task queue ─────────────────────────────────────────────────────────────────
 celery==5.4.0

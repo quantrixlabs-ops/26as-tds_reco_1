@@ -64,7 +64,7 @@ export function StatCard({
     <Card className={cn('', className)}>
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
-          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide truncate">
+          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide whitespace-nowrap">
             {label}
           </p>
           <p className={cn('text-2xl font-bold mt-1', accentColor)}>{value}</p>

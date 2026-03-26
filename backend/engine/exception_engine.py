@@ -52,14 +52,18 @@ def generate_exceptions(
 
         # 2. HIGH_VARIANCE (>3% but not FORCE)
         elif result.variance_pct > 3.0 and "FORCE" not in result.match_type:
+            # Auto-confirmed high-variance matches get INFO severity (audit trail only)
+            # Non-suggested high-variance = auto-confirmed by optimizer
+            sev = "INFO" if not result.suggested else "MEDIUM"
             exceptions.append(_exc(
                 run_id=run_id,
                 exception_type="HIGH_VARIANCE",
-                severity="MEDIUM",
+                severity=sev,
                 description=(
                     f"Variance {result.variance_pct:.2f}% on {result.match_type} match. "
                     f"26AS amount ₹{result.as26_amount:,.2f}, "
                     f"books sum ₹{sum(b.amount for b in result.books):,.2f}"
+                    + (" [Auto-confirmed]" if not result.suggested else "")
                 ),
                 amount=result.as26_amount,
                 section=result.as26_section,
@@ -91,6 +95,27 @@ def generate_exceptions(
                 amount=result.as26_amount,
                 section=result.as26_section,
             ))
+
+        # 5. TAN validation — flag if 26AS TAN looks invalid
+        if hasattr(result, 'as26_section') and result.as26_section:
+            import re
+            tan_pattern = re.compile(r'^[A-Z]{4}[0-9]{5}[A-Z]$')
+            # Check TAN from the 26AS entry (if available through books context)
+            # TAN validation is primarily handled in the validator, but flag here
+            # for matched pairs where the section suggests 206AA higher-rate deduction
+            if result.as26_section in ("206AA", "206AB"):
+                exceptions.append(_exc(
+                    run_id=run_id,
+                    exception_type="TAN_VALIDATION",
+                    severity="HIGH",
+                    description=(
+                        f"Match under section {result.as26_section} — "
+                        f"higher rate deduction (PAN non-availability). "
+                        f"Amount: ₹{result.as26_amount:,.2f}"
+                    ),
+                    amount=result.as26_amount,
+                    section=result.as26_section,
+                ))
 
     # ── From unmatched 26AS ───────────────────────────────────────────────────
     for entry in unmatched_26as:

@@ -132,6 +132,7 @@ def _config_snapshot(match_cfg: Optional[MatchConfig] = None) -> dict:
 def _determine_unmatched_reason(
     entry: As26Entry,
     book_entries: List[BookEntry],
+    noise_threshold: float = 1.0,
 ) -> Tuple[str, str]:
     """Determine a specific reason code for an unmatched 26AS entry.
 
@@ -140,8 +141,8 @@ def _determine_unmatched_reason(
     # U04: Amount too small or negative
     if entry.amount <= 0:
         return "U04", "Amount is zero or negative"
-    if entry.amount < 1.0:
-        return "U04", "Amount below noise threshold"
+    if noise_threshold > 0 and entry.amount < noise_threshold:
+        return "U04", f"Amount below noise threshold (₹{noise_threshold})"
 
     # U01: No candidate invoices found at all
     if not book_entries:
@@ -244,6 +245,7 @@ async def run_reconciliation(
             doc_types_include=set(match_cfg.doc_types_include) if match_cfg.doc_types_include else None,
             doc_types_exclude=set(match_cfg.doc_types_exclude) if match_cfg.doc_types_exclude else None,
             exclude_sgl_v=match_cfg.exclude_sgl_v,
+            noise_threshold=match_cfg.noise_threshold,
         )
 
         # If exclude_sgl_v is False (user enabled advance payments), SGL_V entries
@@ -371,19 +373,30 @@ async def run_reconciliation(
                               detail=f"Saving {len(matched_results)} matched pairs...", phase_pct=0)
         deductor_name = ""
         tan = ""
-        if deductor_filter_parties and len(deductor_filter_parties) > 1:
+        if deductor_filter_parties:
+            # Pick the most frequent name variant (canonical) instead of concatenating all
+            from collections import Counter
             names = [p["deductor_name"] for p in deductor_filter_parties if p.get("deductor_name")]
-            deductor_name = " + ".join(names)
+            if names:
+                deductor_name = Counter(names).most_common(1)[0][0]
             tan = deductor_filter_parties[0].get("tan", "")
         elif as26_entries:
-            deductor_name = as26_entries[0].deductor_name
+            # Fallback: pick most frequent name from 26AS entries for this TAN
+            from collections import Counter
+            name_counts = Counter(e.deductor_name for e in as26_entries if e.deductor_name)
+            deductor_name = name_counts.most_common(1)[0][0] if name_counts else as26_entries[0].deductor_name
             tan = as26_entries[0].tan
 
         for result in matched_results:
             score_d = result.score.to_dict()
+            # Auto-confirmed high-variance matches get audit remark
+            remark = None
+            if result.ai_risk_flag and result.alert_message:
+                remark = result.alert_message
             mp = MatchedPair(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_entry(result),
+                as26_index=result.as26_index,
                 as26_amount=result.as26_amount,
                 as26_date=result.as26_date,
                 section=result.as26_section,
@@ -406,6 +419,9 @@ async def run_reconciliation(
                 score_historical=score_d["score_historical"],
                 cross_fy=result.cross_fy,
                 is_prior_year=result.is_prior_year,
+                ai_risk_flag=result.ai_risk_flag,
+                ai_risk_reason=result.ai_risk_reason,
+                remark=remark,
             )
             db.add(mp)
 
@@ -452,6 +468,7 @@ async def run_reconciliation(
         progress_store.update(run.id, detail=f"Saving {len(unmatched_entries)} unmatched 26AS entries...", phase_pct=60)
         # Build a set of book indices consumed by both matched and suggested results
         # so that unmatched reason code logic uses the remaining books
+        effective_noise = match_cfg.noise_threshold if match_cfg else 1.0
         consumed_book_indices = set()  # type: set
         for r in matched_results:
             for b in r.books:
@@ -461,8 +478,12 @@ async def run_reconciliation(
                 consumed_book_indices.add(b.index)
         remaining_books = [b for b in book_entries if b.index not in consumed_book_indices]
 
+        seen_unmatched_idx: set = set()
         for entry in unmatched_entries:
-            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books)
+            if entry.index in seen_unmatched_idx:
+                continue
+            seen_unmatched_idx.add(entry.index)
+            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books, noise_threshold=effective_noise)
             db.add(Unmatched26AS(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_idx(entry.index),
@@ -490,7 +511,7 @@ async def run_reconciliation(
 
         # ── 10. Generate exceptions ───────────────────────────────────────────
         progress_store.update(run.id, status="EXCEPTIONS", detail="Generating exception flags...", phase_pct=0)
-        exc_dicts = generate_exceptions(matched_results, unmatched_entries, val_report, run.id)
+        exc_dicts = generate_exceptions(matched_results + suggested_results, unmatched_entries, val_report, run.id)
         for exc in exc_dicts:
             db.add(ExceptionRecord(**exc))
         progress_store.update(run.id, detail=f"{len(exc_dicts)} exceptions generated", phase_pct=100)
@@ -499,7 +520,14 @@ async def run_reconciliation(
         progress_store.update(run.id, status="FINALIZING", detail="Updating run summary...", phase_pct=0)
         run.deductor_name = deductor_name
         run.tan = tan
-        run.status = "PENDING_REVIEW" if exc_dicts else "APPROVED"
+        # Auto-approve if: no blocking exceptions (INFO-only is OK) AND match rate >= 50% AND at least 1 match
+        blocking_exceptions = [e for e in exc_dicts if e.get("severity") not in ("INFO",)]
+        needs_review = (
+            bool(blocking_exceptions)
+            or match_rate < 50.0
+            or len(matched_results) == 0
+        )
+        run.status = "PENDING_REVIEW" if needs_review else "APPROVED"
         run.total_26as_entries = len(as26_entries)
         run.total_sap_entries = len(book_entries)
         run.matched_count = len(matched_results)
@@ -518,11 +546,20 @@ async def run_reconciliation(
         run.matched_amount = matched_amount
         run.unmatched_26as_amount = unmatched_amount
         run.control_total_balanced = control_totals["balanced"]
-        run.validation_errors = val_report.to_dict() if val_report.issues else None
+        # Always store validation summary (raw/valid/rejected counts) even if no issues
+        run.validation_errors = val_report.to_dict()
         run.has_pan_issues = val_report.pan_issues > 0
         run.has_rate_mismatches = val_report.rate_mismatches > 0
         run.has_duplicate_26as = val_report.duplicates_found > 0
         run.completed_at = datetime.now(timezone.utc)
+
+        # ── Count invariant check ──────────────────────────────────────────
+        _check_count_invariant(
+            matched_results, suggested_results, unmatched_entries,
+            len(as26_entries), run.id,
+            raw_26as_total=val_report.total_rows,
+            rejected_26as=val_report.rejected_rows,
+        )
 
         await log_event(db, "RUN_COMPLETED",
                         f"Run RUN-{run_num:04d} completed. "
@@ -590,6 +627,7 @@ async def run_reconciliation_on_existing_run(
             doc_types_include=set(match_cfg.doc_types_include) if match_cfg.doc_types_include else None,
             doc_types_exclude=set(match_cfg.doc_types_exclude) if match_cfg.doc_types_exclude else None,
             exclude_sgl_v=match_cfg.exclude_sgl_v,
+            noise_threshold=match_cfg.noise_threshold,
         )
 
         # Handle SGL_V entries — same logic as run_reconciliation
@@ -684,19 +722,29 @@ async def run_reconciliation_on_existing_run(
 
         deductor_name = ""
         tan = ""
-        if deductor_filter_parties and len(deductor_filter_parties) > 1:
+        if deductor_filter_parties:
+            # Pick the most frequent name variant (canonical) instead of concatenating all
+            from collections import Counter
             names = [p["deductor_name"] for p in deductor_filter_parties if p.get("deductor_name")]
-            deductor_name = " + ".join(names)
+            if names:
+                deductor_name = Counter(names).most_common(1)[0][0]
             tan = deductor_filter_parties[0].get("tan", "")
         elif as26_entries:
-            deductor_name = as26_entries[0].deductor_name
+            # Fallback: pick most frequent name from 26AS entries for this TAN
+            from collections import Counter
+            name_counts = Counter(e.deductor_name for e in as26_entries if e.deductor_name)
+            deductor_name = name_counts.most_common(1)[0][0] if name_counts else as26_entries[0].deductor_name
             tan = as26_entries[0].tan
 
         for result in matched_results:
             score_d = result.score.to_dict()
+            remark = None
+            if result.ai_risk_flag and result.alert_message:
+                remark = result.alert_message
             mp = MatchedPair(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_entry(result),
+                as26_index=result.as26_index,
                 as26_amount=result.as26_amount,
                 as26_date=result.as26_date,
                 section=result.as26_section,
@@ -719,6 +767,9 @@ async def run_reconciliation_on_existing_run(
                 score_historical=score_d["score_historical"],
                 cross_fy=result.cross_fy,
                 is_prior_year=result.is_prior_year,
+                ai_risk_flag=result.ai_risk_flag,
+                ai_risk_reason=result.ai_risk_reason,
+                remark=remark,
             )
             db.add(mp)
 
@@ -764,6 +815,7 @@ async def run_reconciliation_on_existing_run(
         # ── Persist unmatched entries ─────────────────────────────────────────
         progress_store.update(run.id, detail="Saving unmatched entries...", phase_pct=60)
         # Build remaining books for reason code determination
+        effective_noise = match_cfg.noise_threshold if match_cfg else 1.0
         consumed_book_indices = set()  # type: set
         for r in matched_results:
             for b in r.books:
@@ -773,8 +825,12 @@ async def run_reconciliation_on_existing_run(
                 consumed_book_indices.add(b.index)
         remaining_books = [b for b in book_entries if b.index not in consumed_book_indices]
 
+        seen_unmatched_idx: set = set()
         for entry in unmatched_entries:
-            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books)
+            if entry.index in seen_unmatched_idx:
+                continue
+            seen_unmatched_idx.add(entry.index)
+            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books, noise_threshold=effective_noise)
             db.add(Unmatched26AS(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_idx(entry.index),
@@ -801,7 +857,7 @@ async def run_reconciliation_on_existing_run(
                 ))
 
         progress_store.update(run.id, status="EXCEPTIONS", detail="Generating exceptions...")
-        exc_dicts = generate_exceptions(matched_results, unmatched_entries, val_report, run.id)
+        exc_dicts = generate_exceptions(matched_results + suggested_results, unmatched_entries, val_report, run.id)
         for exc in exc_dicts:
             db.add(ExceptionRecord(**exc))
 
@@ -809,7 +865,13 @@ async def run_reconciliation_on_existing_run(
 
         run.deductor_name = deductor_name
         run.tan = tan
-        run.status = "PENDING_REVIEW" if exc_dicts else "APPROVED"
+        blocking_exceptions = [e for e in exc_dicts if e.get("severity") not in ("INFO",)]
+        needs_review = (
+            bool(blocking_exceptions)
+            or match_rate < 50.0
+            or len(matched_results) == 0
+        )
+        run.status = "PENDING_REVIEW" if needs_review else "APPROVED"
         run.total_26as_entries = len(as26_entries)
         run.total_sap_entries = len(book_entries)
         run.matched_count = len(matched_results)
@@ -828,13 +890,22 @@ async def run_reconciliation_on_existing_run(
         run.matched_amount = matched_amount
         run.unmatched_26as_amount = unmatched_amount
         run.control_total_balanced = control_totals["balanced"]
-        run.validation_errors = val_report.to_dict() if val_report.issues else None
+        # Always store validation summary (raw/valid/rejected counts) even if no issues
+        run.validation_errors = val_report.to_dict()
         run.has_pan_issues = val_report.pan_issues > 0
         run.has_rate_mismatches = val_report.rate_mismatches > 0
         run.has_duplicate_26as = val_report.duplicates_found > 0
         run.completed_at = datetime.now(timezone.utc)
         run.config_snapshot = _config_snapshot(match_cfg)
         run.run_config = match_cfg.to_dict()
+
+        # ── Count invariant check ──────────────────────────────────────────
+        _check_count_invariant(
+            matched_results, suggested_results, unmatched_entries,
+            len(as26_entries), run.id,
+            raw_26as_total=val_report.total_rows,
+            rejected_26as=val_report.rejected_rows,
+        )
 
         await log_event(db, "RUN_COMPLETED",
                         f"Run RUN-{run.run_number:04d} completed. "
@@ -861,6 +932,80 @@ async def run_reconciliation_on_existing_run(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _check_count_invariant(
+    matched_results: list,
+    suggested_results: list,
+    unmatched_entries: list,
+    total_26as: int,
+    run_id: str,
+    raw_26as_total: int = 0,
+    rejected_26as: int = 0,
+) -> None:
+    """
+    Assert: unique matched + unique suggested + unique unmatched == total 26AS entries.
+    Suggested entries are a sub-bucket of "not yet confirmed" — they don't overlap with
+    matched or unmatched.
+    If violated, raise ValueError so the run is marked FAILED rather than persisting
+    inconsistent data.
+
+    raw_26as_total and rejected_26as are informational — logged for audit trail but
+    not part of the invariant (rejected entries are correctly excluded pre-algorithm).
+    """
+    matched_indices = {r.as26_index for r in matched_results}
+    suggested_indices = {r.as26_index for r in suggested_results}
+    unmatched_indices = {e.index for e in unmatched_entries}
+
+    # Check for duplicate as26 indices within each bucket (should never happen)
+    if len(matched_indices) != len(matched_results):
+        dupes = len(matched_results) - len(matched_indices)
+        raise ValueError(
+            f"Invariant violation in run {run_id}: "
+            f"{dupes} duplicate as26_index values in matched results"
+        )
+    if len(suggested_indices) != len(suggested_results):
+        dupes = len(suggested_results) - len(suggested_indices)
+        raise ValueError(
+            f"Invariant violation in run {run_id}: "
+            f"{dupes} duplicate as26_index values in suggested results"
+        )
+
+    # Suggested should not overlap with matched
+    overlap_ms = matched_indices & suggested_indices
+    if overlap_ms:
+        raise ValueError(
+            f"Invariant violation in run {run_id}: "
+            f"{len(overlap_ms)} 26AS entries appear in BOTH matched and suggested"
+        )
+
+    # Unmatched should not overlap with matched or suggested
+    overlap_mu = matched_indices & unmatched_indices
+    overlap_su = suggested_indices & unmatched_indices
+    if overlap_mu or overlap_su:
+        raise ValueError(
+            f"Invariant violation in run {run_id}: "
+            f"{len(overlap_mu)} matched/unmatched overlap, "
+            f"{len(overlap_su)} suggested/unmatched overlap"
+        )
+
+    accounted = len(matched_indices) + len(suggested_indices) + len(unmatched_indices)
+    if accounted != total_26as:
+        raise ValueError(
+            f"Count invariant violation in run {run_id}: "
+            f"matched({len(matched_indices)}) + suggested({len(suggested_indices)}) "
+            f"+ unmatched({len(unmatched_indices)}) = {accounted} ≠ total_26as({total_26as})"
+        )
+
+    # Log the effective counts for the new model:
+    # confirmed = matched, pending_review = suggested, truly_unmatched = unmatched
+    logger.info(
+        f"Count invariant OK for {run_id}: "
+        f"confirmed={len(matched_indices)}, pending_review={len(suggested_indices)}, "
+        f"truly_unmatched={len(unmatched_indices)}, total={total_26as}"
+        + (f" | raw_26as={raw_26as_total}, rejected_by_validation={rejected_26as}"
+           if raw_26as_total else "")
+    )
+
 
 def _df_to_book_entries(
     df: pd.DataFrame,
@@ -900,7 +1045,7 @@ def _df_to_as26_entries(df: pd.DataFrame) -> List[As26Entry]:
 
 
 def _hash_as26_entry(result: AssignmentResult) -> str:
-    sig = f"{result.as26_amount}|{result.as26_date}|{result.as26_section}"
+    sig = f"{result.as26_index}|{result.as26_amount}|{result.as26_date}|{result.as26_section}"
     return hashlib.sha256(sig.encode()).hexdigest()[:16]
 
 

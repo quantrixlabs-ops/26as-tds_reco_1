@@ -104,14 +104,8 @@ function AppRoutes() {
           </PrivateRoute>
         }
       />
-      <Route
-        path="/runs/batch"
-        element={
-          <PrivateRoute>
-            <RunHistoryPage defaultMode="BATCH" />
-          </PrivateRoute>
-        }
-      />
+      {/* Redirect old batch URL to unified run history */}
+      <Route path="/runs/batch" element={<Navigate to="/runs" replace />} />
       <Route
         path="/runs/new"
         element={

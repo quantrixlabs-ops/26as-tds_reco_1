@@ -54,6 +54,7 @@ export function formatDate(
 }
 
 export function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '—';
   return formatDate(value, 'dd MMM yyyy, HH:mm') + ' IST';
 }
 

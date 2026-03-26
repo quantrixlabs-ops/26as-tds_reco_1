@@ -117,5 +117,6 @@ frontend/src/
 - **Config split**: Algorithm constants in `config.py`, environment config in `core/settings.py` via `.env`.
 - **SAP columns are positional** (not by name): col[4]=ClearingDoc, col[5]=DocType, col[6]=DocDate, col[8]=SGL, col[10]=Amount, col[14]=InvoiceRef.
 - **26AS parsing**: Status=F rows only, "Amount Paid/Credited" column (NOT Tax Deducted), header auto-detected within first 5 rows.
-- **PuLP CBC**: May fail on Apple Silicon (x86_64 binary). Runtime detection with subprocess test, graceful fallback to scipy/greedy.
+- **Scipy fallback**: If scipy is unavailable, the bipartite matcher falls back to score-descending greedy. No PuLP/CBC is used.
 - **Color theme**: Primary brand color is `#1B3A5C` (navy blue).
+ 

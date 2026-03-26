@@ -141,3 +141,27 @@ async def auto_migrate() -> None:
                     stmt = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {sql_type}{default}"
                     await conn.execute(text(stmt))
                     logger.info(f"auto_migrate: added {table_name}.{col_name} ({sql_type})")
+
+            # Auto-add missing unique constraints / indexes
+            from sqlalchemy import UniqueConstraint as UC
+            for constraint in table.constraints:
+                if isinstance(constraint, UC) and constraint.name:
+                    col_names = [c.name for c in constraint.columns]
+                    idx_name = constraint.name
+                    cols_sql = ", ".join(col_names)
+                    try:
+                        # Clean up existing duplicates before creating unique index
+                        if len(col_names) >= 2 and table_name == "matched_pairs":
+                            await conn.execute(text(
+                                "DELETE FROM matched_pairs WHERE rowid NOT IN ("
+                                "  SELECT MIN(rowid) FROM matched_pairs "
+                                "  GROUP BY run_id, as26_row_hash"
+                                ")"
+                            ))
+                        await conn.execute(text(
+                            f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} "
+                            f"ON {table_name} ({cols_sql})"
+                        ))
+                        logger.info(f"auto_migrate: ensured unique index {idx_name} on {table_name}({cols_sql})")
+                    except Exception as e:
+                        logger.warning(f"auto_migrate: could not create {idx_name}: {e}")

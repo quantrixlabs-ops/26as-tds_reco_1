@@ -60,7 +60,7 @@ function buildTrackerItems(
         type: 'high_variance',
         label: 'High Variance Match',
         severity: m.variance_pct > 5 ? 'critical' : 'warning',
-        reference: `26AS #${m.as26_index}`,
+        reference: `26AS #${m.as26_index ?? '—'}`,
         amount: m.as26_amount,
         detail: `Variance ${formatPct(m.variance_pct)} (${formatCurrency(m.variance_amt)}) — ${m.invoice_count} invoice(s)`,
         section: m.section,
@@ -77,7 +77,7 @@ function buildTrackerItems(
         type: 'low_confidence',
         label: 'Low Confidence Match',
         severity: 'warning',
-        reference: `26AS #${m.as26_index}`,
+        reference: `26AS #${m.as26_index ?? '—'}`,
         amount: m.as26_amount,
         detail: `${m.match_type} — ${m.invoice_refs.join(', ')}`,
         section: m.section,
@@ -94,7 +94,7 @@ function buildTrackerItems(
         type: 'force_match',
         label: 'Force Match',
         severity: 'warning',
-        reference: `26AS #${m.as26_index}`,
+        reference: `26AS #${m.as26_index ?? '—'}`,
         amount: m.as26_amount,
         detail: `${m.match_type} — variance ${formatPct(m.variance_pct)}`,
         section: m.section,
@@ -104,19 +104,19 @@ function buildTrackerItems(
   }
 
   // Unmatched 26AS entries
-  for (const u of unmatched26as) {
+  unmatched26as.forEach((u, i) => {
     items.push({
-      id: `u26-${u.index}`,
+      id: `u26-${u.index ?? i}`,
       type: 'unmatched_26as',
       label: 'Unmatched 26AS',
       severity: 'critical',
-      reference: `26AS #${u.index}`,
+      reference: `26AS #${u.index ?? i + 1}`,
       amount: u.amount,
-      detail: `${u.reason_code}: ${u.reason_label}`,
+      detail: `${u.reason_code ?? '—'}: ${u.reason_label ?? '—'}`,
       section: u.section,
       date: (u.date ?? u.transaction_date) ?? undefined,
     });
-  }
+  });
 
   // Unmatched books (top entries by amount)
   const sortedBooks = [...unmatchedBooks].sort((a, b) => b.amount - a.amount);

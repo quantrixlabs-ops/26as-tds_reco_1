@@ -24,6 +24,7 @@ import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
 import { FullPageSpinner } from '../components/ui/Spinner';
+import { useToast } from '../components/ui/Toast';
 import {
   formatDateTime,
   formatPct,
@@ -125,6 +126,7 @@ function statusIcon(status: string) {
 // ── Batch group card ────────────────────────────────────────────────────────
 
 function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; onRunClick: (id: string) => void; onRefresh: () => void }) {
+  const { toast } = useToast();
   const [expanded, setExpanded] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [authorizing, setAuthorizing] = useState(false);
@@ -169,7 +171,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
           </div>
           <div className="flex items-center gap-3 mt-1 flex-wrap">
             {group.completed > 0 && (
-              <span className="text-xs text-emerald-600 font-medium">{group.completed} completed</span>
+              <span className="text-xs text-emerald-600 font-medium">{group.completed} finished</span>
             )}
             {group.processing > 0 && (
               <span className="text-xs text-blue-600 font-medium">{group.processing} processing</span>
@@ -223,7 +225,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
               <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold">Parties</p>
               <p className="text-lg font-bold text-gray-900">{group.total_parties}</p>
               <p className="text-xs text-gray-400">
-                {group.completed} success · {group.failed} failed
+                {group.completed} finished · {group.failed} failed
               </p>
             </div>
             <div className="bg-white rounded-lg px-3 py-2 border border-gray-100">
@@ -245,7 +247,11 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                 <button
                   onClick={async (e) => {
                     e.stopPropagation();
-                    if (!confirm('Rerun this entire batch with fresh reconciliation? A new batch will be created.')) return;
+                    const hasApproved = group.runs.some((r: any) => r.status === 'APPROVED');
+                    const msg = hasApproved
+                      ? 'This batch contains APPROVED runs. Rerunning will create a new batch with fresh (unapproved) reconciliation results. The original approved runs will NOT be affected.\n\nProceed?'
+                      : 'Rerun this entire batch with fresh reconciliation? A new batch will be created.';
+                    if (!confirm(msg)) return;
                     setRerunning(true);
                     try {
                       const res = await runsApi.batchRerun(group.batch_id);
@@ -292,8 +298,10 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                     setDownloading(true);
                     try {
                       await runsApi.batchDownload(group.batch_id);
-                    } catch (err) {
-                      console.error('Batch download failed:', err);
+                      toast('Excel downloaded', `Combined batch workbook saved`, 'success');
+                    } catch (err: any) {
+                      const msg = err?.response?.data?.detail || err?.message || 'Download failed';
+                      toast('Download failed', msg, 'error');
                     } finally {
                       setDownloading(false);
                     }

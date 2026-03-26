@@ -188,25 +188,32 @@ def _score_section(
 ) -> float:
     """
     0–100 score for section alignment.
-    Currently: if sap_section_map available, check all refs match as26_section.
-    Without map: return 50 (neutral — SAP doesn't carry section, can't penalise).
+    With section map: score based on match ratio.
+    Without section map but with section info: use section-based heuristics.
+    No section at all: return 50 (neutral).
     """
-    if not sap_section_map or not as26_section:
-        return 50.0  # neutral — no section data from SAP
+    if not as26_section:
+        return 50.0  # no 26AS section, can't evaluate
 
-    matches = 0
-    total = 0
-    for ref in invoice_refs:
-        sap_sec = sap_section_map.get(ref)
-        if sap_sec:
-            total += 1
-            if sap_sec.strip() == as26_section.strip():
-                matches += 1
+    if sap_section_map:
+        matches = 0
+        total = 0
+        for ref in invoice_refs:
+            sap_sec = sap_section_map.get(ref)
+            if sap_sec:
+                total += 1
+                if sap_sec.strip() == as26_section.strip():
+                    matches += 1
+        if total > 0:
+            return (matches / total) * 100.0
 
-    if total == 0:
-        return 50.0  # no data, neutral
+    # Without SAP section map: give slight boost for well-known high-volume sections
+    # These sections (194C, 194J, 194H) have standard TDS rates, less ambiguity
+    HIGH_CONFIDENCE_SECTIONS = {"194C", "194J", "194H", "194I", "194A"}
+    if as26_section.strip() in HIGH_CONFIDENCE_SECTIONS:
+        return 60.0  # slight positive bias for standard sections
 
-    return (matches / total) * 100.0
+    return 50.0  # neutral
 
 
 def _score_clearing_doc(clearing_doc: Optional[str]) -> float:

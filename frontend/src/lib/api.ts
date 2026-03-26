@@ -152,6 +152,8 @@ export interface RunSummary {
   match_rate_pct: number;
   matched_count: number;
   total_26as_entries: number;
+  total_sap_entries: number;
+  suggested_count: number;
   unmatched_26as_count: number;
   high_confidence_count: number;
   medium_confidence_count: number;
@@ -168,6 +170,10 @@ export interface RunSummary {
   mode: 'SINGLE' | 'BATCH';
   batch_id: string | null;
   created_by?: string;
+  // Amount totals
+  total_26as_amount: number;
+  matched_amount: number;
+  unmatched_26as_amount: number;
 }
 
 export interface ScoreBreakdown {
@@ -462,7 +468,8 @@ export const runsApi = {
   batchPreview: (sapFiles: File[], as26File: File) => {
     const form = new FormData();
     form.append('as26_file', as26File);
-    sapFiles.forEach((f) => form.append('sap_files', f));
+    // Send only filenames (not full file content) — dramatically faster for large batches
+    form.append('sap_filenames_json', JSON.stringify(sapFiles.map((f) => f.name)));
     return apiClient
       .post<BatchPreviewResponse>('/api/runs/batch/preview', form)
       .then((r) => r.data);
@@ -483,6 +490,38 @@ export const runsApi = {
     if (runConfig) form.append('run_config_json', JSON.stringify(runConfig));
     return apiClient
       .post<BatchRunResponse>('/api/runs/batch', form)
+      .then((r) => r.data);
+  },
+
+  /** Chunked batch: Step 1 — upload 26AS only, get batch_id */
+  batchInit: (
+    as26File: File,
+    financialYear: string,
+    runConfig?: Record<string, unknown> | null,
+  ) => {
+    const form = new FormData();
+    form.append('as26_file', as26File);
+    form.append('financial_year', financialYear);
+    if (runConfig) form.append('run_config_json', JSON.stringify(runConfig));
+    return apiClient
+      .post<{ batch_id: string; status: string }>('/api/runs/batch/init', form)
+      .then((r) => r.data);
+  },
+
+  /** Chunked batch: Step 2 — upload ONE SAP file + its mapping */
+  batchAddParty: (
+    batchId: string,
+    sapFile: File,
+    parties: Array<{ deductor_name: string; tan: string }>,
+  ) => {
+    const form = new FormData();
+    form.append('sap_file', sapFile);
+    form.append('mappings_json', JSON.stringify(parties));
+    return apiClient
+      .post<{ batch_id: string; run: BatchRunSummary; total_so_far: number }>(
+        `/api/runs/batch/${batchId}/add`,
+        form,
+      )
       .then((r) => r.data);
   },
 
@@ -574,6 +613,11 @@ export const runsApi = {
 
   cancel: (id: string) =>
     apiClient.post<{ status: string; run_id: string }>(`/api/runs/${id}/cancel`).then((r) => r.data),
+
+  rerun: (id: string) =>
+    apiClient.post<{ run_id: string; run_number: number; status: string; original_run_id: string }>(
+      `/api/runs/${id}/rerun`,
+    ).then((r) => r.data),
 
   delete: (id: string) =>
     apiClient.delete<{ status: string; run_id: string; run_number: number }>(`/api/runs/${id}`).then((r) => r.data),

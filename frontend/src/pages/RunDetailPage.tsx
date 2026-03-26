@@ -1,7 +1,7 @@
 /**
  * RunDetailPage — full run detail with tabs: Matched / Unmatched 26AS / Unmatched Books / Exceptions / Audit Trail
  */
-import { Fragment, useState } from 'react';
+import { Fragment, useState, useRef, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as TabsPrimitive from '@radix-ui/react-tabs';
@@ -20,9 +20,15 @@ import {
   Lightbulb,
   ChevronRight,
   ChevronDown,
+  ChevronUp,
   PieChart,
   ListChecks,
   FileText,
+  RotateCw,
+  Filter,
+  X,
+  Search,
+  ArrowUpDown,
 } from 'lucide-react';
 import {
   runsApi,
@@ -71,7 +77,7 @@ function MetadataCard({ run }: { run: RunSummary }) {
         </div>
         <div>
           <p className="text-xs text-gray-400 mb-0.5">Deductor</p>
-          <p className="font-medium text-gray-900 truncate">{run.deductor_name}</p>
+          <p className="font-medium text-gray-900 truncate" title={run.deductor_name}>{run.deductor_name}</p>
         </div>
         <div>
           <p className="text-xs text-gray-400 mb-0.5">TAN</p>
@@ -108,38 +114,384 @@ function MetadataCard({ run }: { run: RunSummary }) {
 
 // ── Matched pairs tab ─────────────────────────────────────────────────────────
 
+// ── Helpers for month extraction ────────────────────────────────────────────
+
+const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function parseMonth(dateStr: string | null | undefined): string | null {
+  if (!dateStr) return null;
+  // Supports "DD-Mon-YYYY", "YYYY-MM-DD", "DD/MM/YYYY" etc.
+  const d = new Date(dateStr.replace(/-/g, ' '));
+  if (isNaN(d.getTime())) return null;
+  return `${MONTH_LABELS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+// ── Excel-style dropdown filter ────────────────────────────────────────────
+
+function DropdownFilter({
+  label,
+  options,
+  selected,
+  onChange,
+}: {
+  label: string;
+  options: string[];
+  selected: Set<string>;
+  onChange: (s: Set<string>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const filtered = options.filter((o) => o.toLowerCase().includes(search.toLowerCase()));
+  const isActive = selected.size > 0;
+
+  if (options.length === 0) return null;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => { setOpen(!open); setSearch(''); }}
+        className={cn(
+          'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors',
+          isActive
+            ? 'bg-[#1B3A5C] text-white border-[#1B3A5C]'
+            : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400',
+        )}
+      >
+        <Filter className="h-3 w-3" />
+        {label}
+        {isActive && (
+          <span className="bg-white/20 rounded-full px-1.5 text-[10px] font-bold">{selected.size}</span>
+        )}
+        <ChevronDown className={cn('h-3 w-3 transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 mt-1 w-56 bg-white rounded-lg shadow-lg border border-gray-200 z-50">
+          <div className="p-2 border-b border-gray-100">
+            <div className="relative">
+              <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full pl-7 pr-2 py-1.5 text-xs border border-gray-200 rounded outline-none focus:border-[#1B3A5C]"
+                autoFocus
+              />
+            </div>
+          </div>
+          <div className="px-2 py-1.5 border-b border-gray-100 flex items-center justify-between">
+            <button
+              type="button"
+              onClick={() => onChange(new Set(options))}
+              className="text-[10px] text-[#1B3A5C] font-medium hover:underline"
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              onClick={() => onChange(new Set())}
+              className="text-[10px] text-red-500 font-medium hover:underline"
+            >
+              Clear
+            </button>
+          </div>
+          <div className="max-h-48 overflow-y-auto p-1">
+            {filtered.length === 0 ? (
+              <p className="text-xs text-gray-400 text-center py-3">No matches</p>
+            ) : (
+              filtered.map((opt) => (
+                <label
+                  key={opt}
+                  className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(opt)}
+                    onChange={() => {
+                      const next = new Set(selected);
+                      if (next.has(opt)) next.delete(opt); else next.add(opt);
+                      onChange(next);
+                    }}
+                    className="rounded border-gray-300 text-[#1B3A5C] focus:ring-[#1B3A5C] h-3.5 w-3.5"
+                  />
+                  <span className="text-xs text-gray-700">{opt}</span>
+                </label>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Matched tab with filters + sorting ──────────────────────────────────────
+
 function MatchedTab({ runId }: { runId: string }) {
-  const { data = [], isLoading } = useQuery({
+  const { data = [], isLoading, isError, error } = useQuery({
     queryKey: ['runs', runId, 'matched'],
     queryFn: () => runsApi.matched(runId),
   });
   const [expandedRow, setExpandedRow] = useState<number | null>(null);
 
+  // Global search
+  const [globalSearch, setGlobalSearch] = useState('');
+
+  // Dropdown filter state
+  const [selectedMonths, setSelectedMonths] = useState<Set<string>>(new Set());
+  const [selectedSections, setSelectedSections] = useState<Set<string>>(new Set());
+  const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set());
+  const [selectedConfidence, setSelectedConfidence] = useState<Set<string>>(new Set());
+
+  // Variance range slider state
+  const [varMin, setVarMin] = useState(0);
+  const [varMax, setVarMax] = useState(100);
+  const dataVarMax = data.length > 0 ? Math.ceil(Math.max(...data.map((r) => r.variance_pct), 1)) : 100;
+  const varRangeActive = varMin > 0 || varMax < dataVarMax;
+
+  // Sort state
+  type SortKey = 'as26_index' | 'as26_date' | 'section' | 'as26_amount' | 'books_sum' | 'variance_pct' | 'match_type' | 'confidence' | 'invoice_count';
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+
+  // Derive unique filter options from data
+  const monthOptions = [...new Set(data.map((r) => parseMonth(r.as26_date)).filter(Boolean) as string[])].sort(
+    (a, b) => new Date(a).getTime() - new Date(b).getTime(),
+  );
+  const sectionOptions = [...new Set(data.map((r) => r.section).filter(Boolean))].sort();
+  const typeOptions = [...new Set(data.map((r) => r.match_type))].sort();
+  const confidenceOptions: string[] = ['HIGH', 'MEDIUM', 'LOW'].filter((c) => data.some((r) => r.confidence === c));
+
+  const activeFilterCount =
+    (selectedMonths.size > 0 ? 1 : 0) +
+    (selectedSections.size > 0 ? 1 : 0) +
+    (selectedTypes.size > 0 ? 1 : 0) +
+    (selectedConfidence.size > 0 ? 1 : 0) +
+    (varRangeActive ? 1 : 0) +
+    (globalSearch ? 1 : 0);
+
+  const clearAllFilters = () => {
+    setSelectedMonths(new Set());
+    setSelectedSections(new Set());
+    setSelectedTypes(new Set());
+    setSelectedConfidence(new Set());
+    setVarMin(0);
+    setVarMax(dataVarMax);
+    setGlobalSearch('');
+  };
+
+  // Apply filters
+  const filtered = data.filter((r) => {
+    if (globalSearch) {
+      const q = globalSearch.toLowerCase();
+      const hay = [
+        String(r.as26_index ?? ''),
+        r.as26_date ?? '',
+        r.section ?? '',
+        String(r.as26_amount),
+        String(r.books_sum),
+        r.match_type,
+        r.confidence,
+        r.invoice_refs.join(' '),
+      ].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (selectedMonths.size > 0) {
+      const m = parseMonth(r.as26_date);
+      if (!m || !selectedMonths.has(m)) return false;
+    }
+    if (selectedSections.size > 0 && !selectedSections.has(r.section)) return false;
+    if (selectedTypes.size > 0 && !selectedTypes.has(r.match_type)) return false;
+    if (selectedConfidence.size > 0 && !selectedConfidence.has(r.confidence)) return false;
+    if (varRangeActive && (r.variance_pct < varMin || r.variance_pct > varMax)) return false;
+    return true;
+  });
+
+  // Sort
+  const CONF_RANK: Record<string, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+  const sorted = sortKey
+    ? [...filtered].sort((a, b) => {
+        let cmp = 0;
+        switch (sortKey) {
+          case 'as26_index': cmp = (a.as26_index ?? 0) - (b.as26_index ?? 0); break;
+          case 'as26_date': {
+            const da = a.as26_date ? new Date(a.as26_date.replace(/-/g, ' ')).getTime() : 0;
+            const db = b.as26_date ? new Date(b.as26_date.replace(/-/g, ' ')).getTime() : 0;
+            cmp = da - db;
+            break;
+          }
+          case 'section': cmp = (a.section ?? '').localeCompare(b.section ?? ''); break;
+          case 'as26_amount': cmp = a.as26_amount - b.as26_amount; break;
+          case 'books_sum': cmp = a.books_sum - b.books_sum; break;
+          case 'variance_pct': cmp = a.variance_pct - b.variance_pct; break;
+          case 'match_type': cmp = a.match_type.localeCompare(b.match_type); break;
+          case 'confidence': cmp = (CONF_RANK[a.confidence] ?? 0) - (CONF_RANK[b.confidence] ?? 0); break;
+          case 'invoice_count': cmp = a.invoice_count - b.invoice_count; break;
+        }
+        return sortDir === 'desc' ? -cmp : cmp;
+      })
+    : filtered;
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      if (sortDir === 'asc') setSortDir('desc');
+      else { setSortKey(null); setSortDir('asc'); }
+    } else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
+  const SortIcon = ({ col }: { col: SortKey }) => {
+    if (sortKey !== col) return <ArrowUpDown className="h-3 w-3 text-gray-300" />;
+    return sortDir === 'asc'
+      ? <ChevronUp className="h-3 w-3 text-[#1B3A5C]" />
+      : <ChevronDown className="h-3 w-3 text-[#1B3A5C]" />;
+  };
+
   const toggleRow = (idx: number) => {
     setExpandedRow(expandedRow === idx ? null : idx);
   };
 
+  const columns: { key: SortKey; label: string; align: 'left' | 'right' }[] = [
+    { key: 'as26_index', label: '26AS #', align: 'left' },
+    { key: 'as26_date', label: 'Date', align: 'left' },
+    { key: 'section', label: 'Section', align: 'left' },
+    { key: 'as26_amount', label: '26AS Amount', align: 'right' },
+    { key: 'books_sum', label: 'Books Sum', align: 'right' },
+    { key: 'variance_pct', label: 'Variance', align: 'right' },
+    { key: 'match_type', label: 'Type', align: 'left' },
+    { key: 'confidence', label: 'Confidence', align: 'left' },
+    { key: 'invoice_count', label: 'Invoices', align: 'left' },
+  ];
+
   return (
     <Card padding={false}>
-      <div className="px-4 py-3 border-b border-gray-100">
-        <p className="text-xs text-gray-500">
-          {data.length} matched pairs · books_sum ≤ 26AS amount (Section 199)
-        </p>
+      {/* Toolbar: search bar + dropdown filters */}
+      <div className="px-4 py-3 border-b border-gray-100 space-y-2.5">
+        <div className="flex items-center gap-3">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Search all columns..."
+              value={globalSearch}
+              onChange={(e) => setGlobalSearch(e.target.value)}
+              className="w-full pl-8 pr-8 py-1.5 text-xs border border-gray-200 rounded-lg outline-none focus:border-[#1B3A5C] bg-white"
+            />
+            {globalSearch && (
+              <button
+                type="button"
+                onClick={() => setGlobalSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-gray-400 shrink-0">
+            {activeFilterCount > 0
+              ? <>{sorted.length} of {data.length} pairs</>
+              : <>{data.length} matched pairs</>}
+            {' · '}
+            <span title="Section 199 compliance: books total never exceeds 26AS credit">Sec 199 compliant</span>
+          </p>
+          {activeFilterCount > 0 && (
+            <button
+              type="button"
+              onClick={clearAllFilters}
+              className="flex items-center gap-1 text-[11px] text-red-600 hover:text-red-700 font-medium shrink-0"
+            >
+              <X className="h-3 w-3" /> Clear all
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <DropdownFilter label="Month" options={monthOptions} selected={selectedMonths} onChange={setSelectedMonths} />
+          <DropdownFilter label="Section" options={sectionOptions} selected={selectedSections} onChange={setSelectedSections} />
+          <DropdownFilter label="Type" options={typeOptions} selected={selectedTypes} onChange={setSelectedTypes} />
+          <DropdownFilter label="Confidence" options={confidenceOptions} selected={selectedConfidence} onChange={setSelectedConfidence} />
+          {/* Variance range slider */}
+          <div className={cn(
+            'flex items-center gap-2 px-2.5 py-1 rounded-lg border text-xs',
+            varRangeActive
+              ? 'bg-[#1B3A5C] text-white border-[#1B3A5C]'
+              : 'bg-white text-gray-600 border-gray-200',
+          )}>
+            <span className="font-medium whitespace-nowrap">Var %</span>
+            <input
+              type="range"
+              min={0}
+              max={dataVarMax}
+              step={0.5}
+              value={varMin}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setVarMin(Math.min(v, varMax));
+              }}
+              className="w-16 h-1 accent-[#1B3A5C] cursor-pointer"
+            />
+            <span className="font-mono text-[10px] w-16 text-center tabular-nums">
+              {varMin.toFixed(1)}–{varMax.toFixed(1)}%
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={dataVarMax}
+              step={0.5}
+              value={varMax}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setVarMax(Math.max(v, varMin));
+              }}
+              className="w-16 h-1 accent-[#1B3A5C] cursor-pointer"
+            />
+            {varRangeActive && (
+              <button
+                type="button"
+                onClick={() => { setVarMin(0); setVarMax(dataVarMax); }}
+                className="text-white/70 hover:text-white"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
+
+      {/* Table with sortable headers */}
       <div className="w-full overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="border-b border-gray-200 bg-gray-50">
             <tr>
               <th className="px-2 py-3 w-8" />
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">26AS #</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Date</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Section</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-right whitespace-nowrap">26AS Amount</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-right whitespace-nowrap">Books Sum</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-right whitespace-nowrap">Variance</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Type</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Confidence</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Invoices</th>
+              {columns.map((col) => (
+                <th
+                  key={col.key}
+                  className={cn(
+                    'px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-700 transition-colors',
+                    col.align === 'right' ? 'text-right' : 'text-left',
+                  )}
+                  onClick={() => handleSort(col.key)}
+                >
+                  <span className={cn('inline-flex items-center gap-1', col.align === 'right' && 'flex-row-reverse')}>
+                    {col.label}
+                    <SortIcon col={col.key} />
+                  </span>
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -151,13 +503,27 @@ function MatchedTab({ runId }: { runId: string }) {
                   ))}
                 </tr>
               ))
-            ) : data.length === 0 ? (
+            ) : isError ? (
               <tr>
-                <td colSpan={10} className="px-4 py-12 text-center text-gray-400 text-sm">No matched pairs found</td>
+                <td colSpan={10} className="px-4 py-12 text-center text-sm">
+                  <div className="flex flex-col items-center gap-2">
+                    <AlertTriangle className="h-5 w-5 text-red-400" />
+                    <span className="text-red-600 font-medium">Failed to load matched pairs</span>
+                    <span className="text-gray-400 text-xs">{getErrorMessage(error)}</span>
+                  </div>
+                </td>
+              </tr>
+            ) : sorted.length === 0 ? (
+              <tr>
+                <td colSpan={10} className="px-4 py-12 text-center text-gray-400 text-sm">
+                  {activeFilterCount > 0
+                    ? 'No matched pairs match your filters'
+                    : 'No matched pairs for this run'}
+                </td>
               </tr>
             ) : (
-              data.map((r, idx) => (
-                <Fragment key={`matched-${idx}`}>
+              sorted.map((r, idx) => (
+                <Fragment key={`matched-${r.id || idx}`}>
                   <tr
                     className="hover:bg-gray-50 transition-colors cursor-pointer"
                     onClick={() => toggleRow(idx)}
@@ -167,7 +533,7 @@ function MatchedTab({ runId }: { runId: string }) {
                         ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
                         : <ChevronRight className="h-4 w-4" />}
                     </td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-500">#{r.as26_index}</span></td>
+                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-500">#{r.as26_index ?? idx + 1}</span></td>
                     <td className="px-4 py-3"><span className="text-xs">{formatDate(r.as26_date)}</span></td>
                     <td className="px-4 py-3"><span className="font-mono text-xs">{r.section}</span></td>
                     <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.as26_amount)}</span></td>
@@ -186,7 +552,7 @@ function MatchedTab({ runId }: { runId: string }) {
                     </td>
                   </tr>
                   {expandedRow === idx && (
-                    <tr key={`matched-detail-${idx}`} className="bg-gray-50/70">
+                    <tr key={`matched-detail-${r.id || idx}`} className="bg-gray-50/70">
                       <td colSpan={10} className="px-0 py-0">
                         <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm overflow-hidden">
                           <div className="grid grid-cols-1 lg:grid-cols-3 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-gray-100">
@@ -745,9 +1111,15 @@ export default function RunDetailPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState('matched');
 
-  const { data: run, isLoading, refetch } = useQuery({
+  const { data: run, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['runs', id],
     queryFn: () => runsApi.get(id!),
+    retry: (failureCount, err: any) => {
+      // Don't retry on 404 or 422 (invalid UUID)
+      const status = err?.response?.status;
+      if (status === 404 || status === 422) return false;
+      return failureCount < 2;
+    },
     refetchInterval: (query) => {
       const d = query.state.data as RunSummary | undefined;
       return d?.status === 'PROCESSING' ? 5000 : false;
@@ -789,11 +1161,59 @@ export default function RunDetailPage() {
     onError: (err) => toast('Delete failed', getErrorMessage(err), 'error'),
   });
 
+  const rerunMut = useMutation({
+    mutationFn: () => runsApi.rerun(id!),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['runs'] });
+      toast('Re-run started', `New run #${data.run_number} created`, 'success');
+      navigate(`/runs/${data.run_id}`);
+    },
+    onError: (err) => toast('Re-run failed', getErrorMessage(err), 'error'),
+  });
+
   const [rejectNotes, setRejectNotes] = useState('');
   const [showReject, setShowReject] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmRerun, setConfirmRerun] = useState(false);
 
-  if (isLoading || !run) return <FullPageSpinner message="Loading run…" />;
+  if (isLoading) return <FullPageSpinner message="Loading run…" />;
+
+  if (isError || !run) {
+    const status = (error as any)?.response?.status;
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
+        <div className="w-16 h-16 rounded-full bg-red-50 flex items-center justify-center">
+          <AlertTriangle className="h-8 w-8 text-red-400" />
+        </div>
+        <h2 className="text-lg font-bold text-gray-900">
+          {status === 404 ? 'Run Not Found' : 'Failed to Load Run'}
+        </h2>
+        <p className="text-sm text-gray-500 text-center max-w-md">
+          {status === 404
+            ? 'This run does not exist or has been deleted. Check the URL and try again.'
+            : `An error occurred while loading this run. ${getErrorMessage(error)}`}
+        </p>
+        <div className="flex gap-3">
+          <button
+            onClick={() => navigate('/runs')}
+            className="flex items-center gap-2 px-4 py-2 bg-[#1B3A5C] text-white text-sm font-semibold rounded-lg hover:bg-[#15304d] transition-colors"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to Run History
+          </button>
+          {status !== 404 && (
+            <button
+              onClick={() => refetch()}
+              className="flex items-center gap-2 px-4 py-2 border border-gray-200 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Retry
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   const canReview =
     (user?.role === 'REVIEWER' || user?.role === 'ADMIN') &&
@@ -832,9 +1252,10 @@ export default function RunDetailPage() {
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          {/* Refresh */}
+          {/* Refresh data (NOT a reconciliation rerun) */}
           <button
             onClick={() => refetch()}
+            title="Refresh data"
             className="p-2 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50"
           >
             <RefreshCw className="h-4 w-4" />
@@ -854,32 +1275,26 @@ export default function RunDetailPage() {
 
           {/* Delete — visible when not PROCESSING */}
           {run.status !== 'PROCESSING' && (
-            confirmDelete ? (
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs text-red-600">Delete?</span>
-                <button
-                  onClick={() => deleteMut.mutate()}
-                  disabled={deleteMut.isPending}
-                  className="px-2 py-1 rounded bg-red-600 text-white text-xs font-semibold hover:bg-red-700 disabled:opacity-50"
-                >
-                  {deleteMut.isPending ? '…' : 'Yes'}
-                </button>
-                <button
-                  onClick={() => setConfirmDelete(false)}
-                  className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-700"
-                >
-                  No
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => setConfirmDelete(true)}
-                className="p-2 rounded-lg border border-gray-200 text-gray-400 hover:text-red-600 hover:border-red-200 hover:bg-red-50 transition-colors"
-                title="Delete run"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            )
+            <button
+              onClick={() => setConfirmDelete(true)}
+              className="p-2 rounded-lg border border-gray-200 text-gray-400 hover:text-red-600 hover:border-red-200 hover:bg-red-50 transition-colors"
+              title="Delete run"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          )}
+
+          {/* Re-run */}
+          {run.status !== 'PROCESSING' && (
+            <button
+              onClick={() => setConfirmRerun(true)}
+              disabled={rerunMut.isPending}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-blue-200 text-blue-700 text-sm font-medium hover:bg-blue-50 transition-colors disabled:opacity-50"
+              title="Re-run this reconciliation with the same files"
+            >
+              <RotateCw className="h-4 w-4" />
+              {rerunMut.isPending ? 'Starting…' : 'Re-run'}
+            </button>
           )}
 
           {/* Download */}
@@ -923,6 +1338,76 @@ export default function RunDetailPage() {
         </div>
       </div>
 
+      {/* Delete confirmation modal */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+                <Trash2 className="h-5 w-5 text-red-600" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-gray-900">Delete Run #{run.run_number}?</h3>
+                <p className="text-xs text-gray-500 mt-0.5">This action cannot be undone</p>
+              </div>
+            </div>
+            <p className="text-sm text-gray-600 mb-5">
+              All matched pairs, exceptions, audit trail entries, and uploaded files for this run will be permanently deleted.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setConfirmDelete(false)}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => deleteMut.mutate()}
+                disabled={deleteMut.isPending}
+                className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50"
+              >
+                {deleteMut.isPending ? 'Deleting…' : 'Delete permanently'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Re-run confirmation modal */}
+      {confirmRerun && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+                <RotateCw className="h-5 w-5 text-blue-600" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-gray-900">Re-run #{run.run_number}?</h3>
+                <p className="text-xs text-gray-500 mt-0.5">{run.deductor_name}</p>
+              </div>
+            </div>
+            <p className="text-sm text-gray-600 mb-5">
+              A new reconciliation will be created using the same files and settings. The original run will not be modified.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setConfirmRerun(false)}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { setConfirmRerun(false); rerunMut.mutate(); }}
+                disabled={rerunMut.isPending}
+                className="px-4 py-2 text-sm font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+              >
+                {rerunMut.isPending ? 'Starting…' : 'Re-run reconciliation'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Live progress panel — shown while PROCESSING */}
       {run.status === 'PROCESSING' && (
         <RunProgressPanel runId={id!} onComplete={() => refetch()} />
@@ -960,7 +1445,7 @@ export default function RunDetailPage() {
       )}
 
       {/* Metrics grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatCard
           label="Match Rate"
           value={formatPct(run.match_rate_pct)}
@@ -979,6 +1464,12 @@ export default function RunDetailPage() {
           accentColor="text-[#1B3A5C]"
         />
         <StatCard
+          label="Suggested"
+          value={run.suggested_count ?? 0}
+          sub={(run.suggested_count ?? 0) > 0 ? 'Needs review' : 'All resolved'}
+          accentColor={run.suggested_count > 0 ? 'text-amber-600' : 'text-emerald-600'}
+        />
+        <StatCard
           label="Unmatched 26AS"
           value={run.unmatched_26as_count}
           accentColor={run.unmatched_26as_count > 0 ? 'text-red-600' : 'text-emerald-600'}
@@ -990,14 +1481,68 @@ export default function RunDetailPage() {
         />
         <StatCard
           label="Control Total"
-          value={run.control_total_balanced ? 'Balanced' : 'Off'}
-          accentColor={run.control_total_balanced ? 'text-emerald-600' : 'text-red-600'}
+          value={run.control_total_balanced == null ? 'N/A' : run.control_total_balanced ? 'Balanced' : 'Unbalanced'}
+          accentColor={run.control_total_balanced == null ? 'text-gray-400' : run.control_total_balanced ? 'text-emerald-600' : 'text-red-600'}
         />
       </div>
+
+      {/* Financial totals */}
+      {run.status !== 'PROCESSING' && run.status !== 'FAILED' && (run.total_26as_amount ?? 0) > 0 && (
+        <Card>
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Financial Summary</p>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+            <div>
+              <p className="text-xs text-gray-400 mb-0.5">Total as per 26AS</p>
+              <p className="text-base font-bold text-[#1B3A5C]">{formatCurrency(run.total_26as_amount)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 mb-0.5">Total as per Books</p>
+              <p className="text-base font-bold text-gray-800">{formatCurrency(run.matched_amount + (run.total_26as_amount - run.matched_amount - run.unmatched_26as_amount > 0 ? run.total_26as_amount - run.matched_amount - run.unmatched_26as_amount : 0))}</p>
+              <p className="text-[10px] text-gray-400">{run.total_sap_entries || 0} SAP entries</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 mb-0.5">Matched Total</p>
+              <p className="text-base font-bold text-emerald-600">{formatCurrency(run.matched_amount)}</p>
+              <p className="text-[10px] text-gray-400">{run.matched_count} pairs</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 mb-0.5">Unmatched Total</p>
+              <p className={cn('text-base font-bold', run.unmatched_26as_amount > 0 ? 'text-red-600' : 'text-emerald-600')}>
+                {formatCurrency(run.unmatched_26as_amount)}
+              </p>
+              <p className="text-[10px] text-gray-400">{run.unmatched_26as_count} entries</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400 mb-0.5">Suggested Matches Total</p>
+              <p className={cn('text-base font-bold', (run.suggested_count ?? 0) > 0 ? 'text-amber-600' : 'text-emerald-600')}>
+                {formatCurrency(Math.max(0, run.total_26as_amount - run.matched_amount - run.unmatched_26as_amount))}
+              </p>
+              <p className="text-[10px] text-gray-400">{run.suggested_count ?? 0} entries</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Count integrity warning */}
+      {run.status !== 'PROCESSING' && run.total_26as_entries > 0 &&
+        run.matched_count + (run.suggested_count ?? 0) + run.unmatched_26as_count !== run.total_26as_entries && (
+        <Card className="border-red-200 bg-red-50">
+          <div className="flex items-center gap-2 text-red-700 text-sm">
+            <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+            <span>
+              Count mismatch: Matched ({run.matched_count}) + Suggested ({run.suggested_count ?? 0}) + Unmatched ({run.unmatched_26as_count}) = {run.matched_count + (run.suggested_count ?? 0) + run.unmatched_26as_count}, but total 26AS entries = {run.total_26as_entries}. Re-run this reconciliation to fix.
+            </span>
+          </div>
+        </Card>
+      )}
 
       {/* Confidence breakdown */}
       <Card>
         <div className="flex items-center gap-6 flex-wrap">
+          {(() => {
+            const confTotal = (run.high_confidence_count || 0) + (run.medium_confidence_count || 0) + (run.low_confidence_count || 0);
+            return (
+              <>
           <div>
             <p className="text-xs text-gray-400 mb-1">High Confidence</p>
             <div className="flex items-center gap-1.5">
@@ -1005,7 +1550,7 @@ export default function RunDetailPage() {
                 <div
                   className="h-full bg-emerald-500 rounded-full"
                   style={{
-                    width: `${run.matched_count > 0 ? (run.high_confidence_count / run.matched_count) * 100 : 0}%`,
+                    width: `${confTotal > 0 ? (run.high_confidence_count / confTotal) * 100 : 0}%`,
                   }}
                 />
               </div>
@@ -1021,7 +1566,7 @@ export default function RunDetailPage() {
                 <div
                   className="h-full bg-amber-400 rounded-full"
                   style={{
-                    width: `${run.matched_count > 0 ? (run.medium_confidence_count / run.matched_count) * 100 : 0}%`,
+                    width: `${confTotal > 0 ? (run.medium_confidence_count / confTotal) * 100 : 0}%`,
                   }}
                 />
               </div>
@@ -1037,7 +1582,7 @@ export default function RunDetailPage() {
                 <div
                   className="h-full bg-orange-400 rounded-full"
                   style={{
-                    width: `${run.matched_count > 0 ? (run.low_confidence_count / run.matched_count) * 100 : 0}%`,
+                    width: `${confTotal > 0 ? (run.low_confidence_count / confTotal) * 100 : 0}%`,
                   }}
                 />
               </div>
@@ -1046,6 +1591,9 @@ export default function RunDetailPage() {
               </span>
             </div>
           </div>
+              </>
+            );
+          })()}
           {run.has_pan_issues && (
             <Badge variant="red">PAN issues detected</Badge>
           )}
@@ -1060,7 +1608,7 @@ export default function RunDetailPage() {
 
       {/* Tabs */}
       <TabsPrimitive.Root value={tab} onValueChange={setTab}>
-        <TabsPrimitive.List className="flex gap-1 border-b border-gray-200 mb-4">
+        <TabsPrimitive.List className="flex gap-1 border-b border-gray-200 mb-4 overflow-x-auto scrollbar-thin">
           {[
             { value: 'matched', label: 'Matched Pairs', icon: <CheckCircle className="h-3.5 w-3.5" />, count: run.matched_count },
             { value: 'unmatched-26as', label: 'Unmatched 26AS', icon: <AlertTriangle className="h-3.5 w-3.5" />, count: run.unmatched_26as_count },

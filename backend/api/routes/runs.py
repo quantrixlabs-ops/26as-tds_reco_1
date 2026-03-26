@@ -42,6 +42,8 @@ class RunSummary(BaseModel):
     match_rate_pct: float
     matched_count: int
     total_26as_entries: int
+    total_sap_entries: int = 0
+    suggested_count: int
     unmatched_26as_count: int
     high_confidence_count: int
     medium_confidence_count: int
@@ -57,6 +59,11 @@ class RunSummary(BaseModel):
     completed_at: Optional[str]
     mode: str
     batch_id: Optional[str]
+    error_message: Optional[str] = None
+    # Amount totals
+    total_26as_amount: float = 0.0
+    matched_amount: float = 0.0
+    unmatched_26as_amount: float = 0.0
 
 
 class ReviewRequest(BaseModel):
@@ -214,30 +221,6 @@ async def list_runs(
         .limit(limit).offset(offset)
     )
     runs = list(result.scalars().all())
-
-    # Self-healing: bulk recount matched_count from actual unique MatchedPair rows
-    run_ids = [r.id for r in runs if r.total_26as_entries and r.total_26as_entries > 0]
-    if run_ids:
-        count_result = await db.execute(
-            select(
-                MatchedPair.run_id,
-                func.count(func.distinct(MatchedPair.as26_row_hash)),
-            )
-            .where(MatchedPair.run_id.in_(run_ids))
-            .group_by(MatchedPair.run_id)
-        )
-        actual_counts = {row[0]: row[1] for row in count_result.all()}
-
-        dirty = False
-        for r in runs:
-            actual = actual_counts.get(r.id, 0)
-            if r.total_26as_entries and r.total_26as_entries > 0 and actual != (r.matched_count or 0):
-                r.matched_count = actual
-                r.match_rate_pct = (actual / r.total_26as_entries) * 100
-                dirty = True
-        if dirty:
-            await db.commit()
-
     return [_run_to_summary(r) for r in runs]
 
 
@@ -567,10 +550,16 @@ async def batch_authorize_all_suggested(
         run.unmatched_26as_count = unmatched_result.scalar() or 0
         if run.total_26as_entries and run.total_26as_entries > 0:
             run.match_rate_pct = (run.matched_count / run.total_26as_entries) * 100
-        conf_counts = confidence_per_run.get(rid, {})
-        run.high_confidence_count = (run.high_confidence_count or 0) + conf_counts.get("HIGH", 0)
-        run.medium_confidence_count = (run.medium_confidence_count or 0) + conf_counts.get("MEDIUM", 0)
-        run.low_confidence_count = (run.low_confidence_count or 0) + conf_counts.get("LOW", 0)
+        # Recount confidence from authoritative MatchedPair rows (prevents double-counting)
+        conf_result = await db.execute(
+            select(MatchedPair.confidence, func.count(MatchedPair.id))
+            .where(MatchedPair.run_id == rid)
+            .group_by(MatchedPair.confidence)
+        )
+        conf_map = {(row[0] or "LOW").upper(): row[1] for row in conf_result.all()}
+        run.high_confidence_count = conf_map.get("HIGH", 0)
+        run.medium_confidence_count = conf_map.get("MEDIUM", 0)
+        run.low_confidence_count = conf_map.get("LOW", 0)
 
     await db.flush()
 
@@ -613,25 +602,99 @@ async def get_run(
 ):
     run = await _get_run_or_404(run_id, db)
 
-    # Self-healing: recount matched_count from actual unique MatchedPair rows
-    # This corrects any stale counts from prior duplicate-promotion bugs
-    if run.total_26as_entries and run.total_26as_entries > 0:
-        count_result = await db.execute(
-            select(func.count(func.distinct(MatchedPair.as26_row_hash))).where(
-                MatchedPair.run_id == run_id
+    # ── Self-healing recount for stale runs ──
+    # Old runs may have inflated suggested_count from pre-fix authorize operations.
+    # Recount from actual DB state if count integrity is violated.
+    if run.status not in ("PROCESSING",) and run.total_26as_entries and run.total_26as_entries > 0:
+        stored_sum = (run.matched_count or 0) + (run.suggested_count or 0) + (run.unmatched_26as_count or 0)
+        if stored_sum != run.total_26as_entries:
+            matched_ct = await db.execute(
+                select(func.count(func.distinct(MatchedPair.as26_row_hash)))
+                .where(MatchedPair.run_id == run_id)
             )
-        )
-        actual_matched = count_result.scalar() or 0
-        if actual_matched != (run.matched_count or 0):
-            run.matched_count = actual_matched
-            run.match_rate_pct = (actual_matched / run.total_26as_entries) * 100
-            unmatched_result = await db.execute(
+            run.matched_count = matched_ct.scalar() or 0
+
+            suggested_ct = await db.execute(
+                select(func.count(SuggestedMatch.id)).where(
+                    SuggestedMatch.run_id == run_id,
+                    SuggestedMatch.authorized == False,
+                    SuggestedMatch.rejected == False,
+                )
+            )
+            run.suggested_count = suggested_ct.scalar() or 0
+
+            unmatched_ct = await db.execute(
                 select(func.count(Unmatched26AS.id)).where(Unmatched26AS.run_id == run_id)
             )
-            run.unmatched_26as_count = unmatched_result.scalar() or 0
+            run.unmatched_26as_count = unmatched_ct.scalar() or 0
+
+            if run.total_26as_entries > 0:
+                run.match_rate_pct = round((run.matched_count / run.total_26as_entries) * 100, 2)
+
             await db.commit()
 
     return _run_to_summary(run)
+
+
+@router.post("/{run_id}/rerun", status_code=202)
+async def rerun_single(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Rerun a single reconciliation using the stored file bytes.
+    Creates a new run and processes it in the background.
+    """
+    original = await _get_run_or_404(run_id, db)
+
+    if not original.sap_file_blob or not original.as26_file_blob:
+        raise HTTPException(
+            status_code=400,
+            detail="Original files not stored for this run. Re-upload and run manually.",
+        )
+
+    run = await _create_placeholder_run(
+        db, current_user,
+        sap_bytes=original.sap_file_blob,
+        as26_bytes=original.as26_file_blob,
+        sap_filename=original.sap_filename,
+        as26_filename=original.as26_filename,
+        financial_year=original.financial_year,
+        batch_id=original.batch_id,
+        deductor_filter_parties=original.deductor_filter_parties,
+    )
+    await db.commit()
+
+    task = asyncio.create_task(
+        _run_reconciliation_background(
+            run_id=run.id,
+            user_id=current_user.id,
+            sap_bytes=original.sap_file_blob,
+            as26_bytes=original.as26_file_blob,
+            sap_filename=original.sap_filename,
+            as26_filename=original.as26_filename,
+            financial_year=original.financial_year,
+            batch_id=original.batch_id,
+            deductor_filter_parties=original.deductor_filter_parties,
+            run_config=original.run_config,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    await log_event(db, "RUN_RERUN",
+                    f"Run #{original.run_number} rerun as #{run.run_number} "
+                    f"by {current_user.full_name}",
+                    run_id=original.id, user_id=current_user.id,
+                    metadata={"original_run_id": original.id, "new_run_id": run.id})
+
+    return {
+        "run_id": run.id,
+        "run_number": run.run_number,
+        "status": "PROCESSING",
+        "original_run_id": original.id,
+    }
 
 
 @router.get("/{run_id}/matched")
@@ -667,14 +730,44 @@ async def get_unmatched_26as(
         select(Unmatched26AS).where(Unmatched26AS.run_id == run_id)
         .order_by(desc(Unmatched26AS.amount))
     )
+    entries = result.scalars().all()
+    reason_labels = {
+        "U01": "No matching invoice found in SAP",
+        "U02": "Amount variance exceeds tolerance",
+        "U04": "Below noise threshold",
+    }
     return [
         {
-            "id": u.id, "deductor_name": u.deductor_name, "tan": u.tan,
-            "transaction_date": u.transaction_date, "amount": u.amount,
+            "id": u.id, "index": idx + 1, "deductor_name": u.deductor_name,
+            "tan": u.tan, "transaction_date": u.transaction_date,
+            "date": u.transaction_date, "amount": u.amount,
             "section": u.section, "reason_code": u.reason_code,
+            "reason_label": reason_labels.get(u.reason_code, u.reason_code),
             "reason_detail": u.reason_detail,
         }
-        for u in result.scalars().all()
+        for idx, u in enumerate(entries)
+    ]
+
+
+@router.get("/{run_id}/unmatched-books")
+async def get_unmatched_books(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_run_or_404(run_id, db)
+    result = await db.execute(
+        select(UnmatchedBook).where(UnmatchedBook.run_id == run_id)
+        .order_by(desc(UnmatchedBook.amount))
+    )
+    return [
+        {
+            "id": b.id, "invoice_ref": b.invoice_ref, "amount": b.amount,
+            "doc_date": b.doc_date, "doc_type": b.doc_type,
+            "clearing_doc": b.clearing_doc, "sgl_flag": b.flag,
+            "sap_fy": b.sap_fy,
+        }
+        for b in result.scalars().all()
     ]
 
 
@@ -717,15 +810,134 @@ async def review_run(
     if body.action not in ("APPROVED", "REJECTED"):
         raise HTTPException(status_code=400, detail="Action must be APPROVED or REJECTED")
 
+    # Block approval if count integrity is broken — recount from live DB state
+    if body.action == "APPROVED" and run.total_26as_entries and run.total_26as_entries > 0:
+        live_matched = (await db.execute(
+            select(func.count(func.distinct(MatchedPair.as26_row_hash)))
+            .where(MatchedPair.run_id == run_id)
+        )).scalar() or 0
+        live_suggested = (await db.execute(
+            select(func.count(SuggestedMatch.id)).where(
+                SuggestedMatch.run_id == run_id,
+                SuggestedMatch.authorized == False,
+                SuggestedMatch.rejected == False,
+            )
+        )).scalar() or 0
+        live_unmatched = (await db.execute(
+            select(func.count(Unmatched26AS.id)).where(Unmatched26AS.run_id == run_id)
+        )).scalar() or 0
+        accounted = live_matched + live_suggested + live_unmatched
+        if accounted != run.total_26as_entries:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot approve: count integrity violated. "
+                    f"Matched ({live_matched}) + Suggested ({live_suggested}) "
+                    f"+ Unmatched ({live_unmatched}) = {accounted}, "
+                    f"but total 26AS entries = {run.total_26as_entries}. Re-run this reconciliation first."
+                ),
+            )
+        # Sync stored counts with live state
+        run.matched_count = live_matched
+        run.suggested_count = live_suggested
+        run.unmatched_26as_count = live_unmatched
+        if run.total_26as_entries > 0:
+            run.match_rate_pct = round((live_matched / run.total_26as_entries) * 100, 2)
+
+        # Block approval if match rate is below minimum threshold
+        MIN_APPROVAL_MATCH_RATE = 75.0
+        if run.match_rate_pct < MIN_APPROVAL_MATCH_RATE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot approve: match rate {run.match_rate_pct:.1f}% is below the "
+                    f"minimum approval threshold of {MIN_APPROVAL_MATCH_RATE:.0f}%. "
+                    f"Review unmatched entries or authorize suggested matches first."
+                ),
+            )
+
     run.status = body.action
     run.reviewed_by_id = current_user.id
     run.reviewed_at = datetime.now(timezone.utc)
     run.review_notes = body.notes
 
+    # ── On REJECTION: revert any promoted MatchedPairs back to pending suggested ──
+    reverted_count = 0
+    if body.action == "REJECTED":
+        # Find all authorized SuggestedMatches for this run
+        auth_sm_result = await db.execute(
+            select(SuggestedMatch).where(
+                SuggestedMatch.run_id == run_id,
+                SuggestedMatch.authorized == True,
+            )
+        )
+        authorized_sms = list(auth_sm_result.scalars().all())
+
+        for sm in authorized_sms:
+            # Delete the promoted MatchedPair (identified by matching as26_row_hash)
+            if sm.as26_row_hash:
+                await db.execute(
+                    MatchedPair.__table__.delete().where(
+                        MatchedPair.run_id == run_id,
+                        MatchedPair.as26_row_hash == sm.as26_row_hash,
+                    )
+                )
+                # Re-create Unmatched26AS entry (restored from suggested match data)
+                existing_u = await db.execute(
+                    select(Unmatched26AS).where(
+                        Unmatched26AS.run_id == run_id,
+                        Unmatched26AS.as26_row_hash == sm.as26_row_hash,
+                    )
+                )
+                if not existing_u.scalar_one_or_none():
+                    db.add(Unmatched26AS(
+                        run_id=run_id,
+                        as26_row_hash=sm.as26_row_hash,
+                        deductor_name=sm.deductor_name or "",
+                        tan=sm.tan or "",
+                        transaction_date=sm.as26_date,
+                        amount=sm.as26_amount or 0.0,
+                        section=sm.section or "",
+                        reason_code="U02",
+                        reason_detail="Reverted from authorized suggestion after run rejection",
+                    ))
+
+            # Un-authorize the SuggestedMatch
+            sm.authorized = False
+            sm.authorized_by_id = None
+            sm.authorized_at = None
+            sm.remarks = None
+            reverted_count += 1
+
+        if reverted_count > 0:
+            await db.flush()
+            # Recalculate run stats from actual DB state
+            count_result = await db.execute(
+                select(func.count(func.distinct(MatchedPair.as26_row_hash))).where(
+                    MatchedPair.run_id == run_id
+                )
+            )
+            run.matched_count = count_result.scalar() or 0
+            unmatched_result = await db.execute(
+                select(func.count(Unmatched26AS.id)).where(Unmatched26AS.run_id == run_id)
+            )
+            run.unmatched_26as_count = unmatched_result.scalar() or 0
+            suggested_result = await db.execute(
+                select(func.count(SuggestedMatch.id)).where(
+                    SuggestedMatch.run_id == run_id,
+                    SuggestedMatch.authorized == False,
+                    SuggestedMatch.rejected == False,
+                )
+            )
+            run.suggested_count = suggested_result.scalar() or 0
+            if run.total_26as_entries and run.total_26as_entries > 0:
+                run.match_rate_pct = (run.matched_count / run.total_26as_entries) * 100
+
     await log_event(db, f"RUN_{body.action}",
                     f"Run RUN-{run.run_number:04d} {body.action.lower()} by {current_user.full_name}",
                     run_id=run_id, user_id=current_user.id,
-                    metadata={"action": body.action, "notes": body.notes})
+                    metadata={"action": body.action, "notes": body.notes,
+                              "reverted_promotions": reverted_count})
 
     return {"status": run.status, "reviewed_by": current_user.full_name}
 
@@ -794,14 +1006,22 @@ async def delete_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Delete a completed/failed run and all its associated data."""
+    """Delete a completed/failed run and all its associated data.
+    Audit logs are PRESERVED for regulatory compliance — only result data is deleted.
+    """
     run = await _get_run_or_404(run_id, db)
     if run.status == "PROCESSING":
         raise HTTPException(status_code=400, detail="Cannot delete a run that is still processing. Cancel it first.")
 
-    # Delete child records
-    from db.models import AuditLog
-    for model in [MatchedPair, Unmatched26AS, UnmatchedBook, ExceptionRecord, AuditLog]:
+    # Log deletion BEFORE removing data (audit trail must capture the event)
+    await log_event(db, "RUN_DELETED",
+                    f"Run RUN-{run.run_number:04d} deleted by {current_user.full_name}",
+                    run_id=run_id, user_id=current_user.id,
+                    metadata={"run_number": run.run_number, "status_at_deletion": run.status,
+                              "matched_count": run.matched_count, "match_rate_pct": run.match_rate_pct})
+
+    # Delete child records — AuditLog is intentionally EXCLUDED (immutable audit trail)
+    for model in [MatchedPair, SuggestedMatch, Unmatched26AS, UnmatchedBook, ExceptionRecord]:
         await db.execute(
             model.__table__.delete().where(model.run_id == run_id)
         )
@@ -867,20 +1087,32 @@ async def get_audit_trail(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from db.models import AuditLog
+    from db.models import AuditLog, User as UserModel
     result = await db.execute(
         select(AuditLog).where(AuditLog.run_id == run_id)
         .order_by(AuditLog.created_at)
     )
+    logs = result.scalars().all()
+
+    # Pre-load user names/roles for all referenced user_ids
+    user_ids = {l.user_id for l in logs if l.user_id}
+    user_map: dict = {}
+    if user_ids:
+        u_result = await db.execute(select(UserModel).where(UserModel.id.in_(user_ids)))
+        for u in u_result.scalars().all():
+            user_map[u.id] = u
+
     return [
         {
+            "id": l.id,
             "event_type": l.event_type,
-            "description": l.description,
-            "user_id": l.user_id,
-            "created_at": l.created_at.isoformat(),
+            "actor": user_map[l.user_id].full_name if l.user_id and l.user_id in user_map else "System",
+            "actor_role": user_map[l.user_id].role if l.user_id and l.user_id in user_map else "SYSTEM",
+            "timestamp": l.created_at.isoformat() if l.created_at else None,
+            "notes": l.description,
             "metadata": l.event_metadata,
         }
-        for l in result.scalars().all()
+        for l in logs
     ]
 
 
@@ -964,26 +1196,43 @@ async def stream_progress(
     )
 
 
-# ── Batch: Preview Mappings ───────────────────────────────────────────────────
+# ── Batch: Preview Mappings (lightweight — filenames only) ────────────────────
 
 @router.post("/batch/preview", status_code=200)
 async def preview_batch_mappings(
     as26_file: UploadFile = File(...),
-    sap_files: List[UploadFile] = File(...),
+    sap_filenames_json: Optional[str] = Form(default=None),
+    sap_files: Optional[List[UploadFile]] = File(default=None),
     current_user: User = Depends(get_current_user),
 ):
     """
     Dry-run only — no DB writes.
     Parse 26AS and fuzzy-match each SAP filename to a deductor.
     Returns proposed mappings + full party list for manual override.
-    If the 26AS file has no deductor column, returns no_deductors=true
-    so the frontend can skip the mapping step.
+
+    Accepts SAP filenames in two ways (for backward compatibility):
+    1. sap_filenames_json: JSON array of filename strings (lightweight, preferred)
+    2. sap_files: actual file uploads (legacy, only filenames are used)
     """
     from aligner import align_deductor, extract_identity_string
     from parser_26as import parse_26as
     import pandas as pd
 
     as26_bytes = await as26_file.read()
+
+    # Collect SAP filenames from either source
+    filenames: List[str] = []
+    if sap_filenames_json:
+        try:
+            filenames = _json.loads(sap_filenames_json)
+            if not isinstance(filenames, list):
+                raise ValueError("Expected a list")
+        except Exception:
+            raise HTTPException(status_code=422, detail="sap_filenames_json must be a JSON array of strings")
+    elif sap_files:
+        filenames = [f.filename or "unknown.xlsx" for f in sap_files]
+    else:
+        raise HTTPException(status_code=422, detail="Provide sap_filenames_json or sap_files")
 
     # Try parsing — 26AS may lack deductor_name column (single-party files)
     no_deductors = False
@@ -1010,8 +1259,7 @@ async def preview_batch_mappings(
     mappings = []
     if no_deductors or not all_parties:
         # No deductors found — return identity strings but no candidates
-        for sap_file in sap_files:
-            filename = sap_file.filename or "unknown.xlsx"
+        for filename in filenames:
             mappings.append({
                 "sap_filename": filename,
                 "identity_string": extract_identity_string(filename),
@@ -1022,8 +1270,7 @@ async def preview_batch_mappings(
                 "top_candidates": [],
             })
     else:
-        for sap_file in sap_files:
-            filename = sap_file.filename or "unknown.xlsx"
+        for filename in filenames:
             result = align_deductor(filename, as26_df)
             mappings.append({
                 "sap_filename": filename,
@@ -1046,7 +1293,136 @@ async def preview_batch_mappings(
     return {"mappings": mappings, "all_parties": all_parties, "no_deductors": no_deductors}
 
 
-# ── Batch: Run All ─────────────────────────────────────────────────────────────
+# ── Batch: Chunked flow (init → add-party) ──────────────────────────────────
+
+import time as _time
+
+# In-memory store for batch sessions: batch_id → {as26_bytes, as26_filename, ...}
+_batch_sessions: Dict[str, Dict] = {}
+_BATCH_SESSION_TTL = 3600  # 1 hour
+
+
+def _purge_batch_sessions() -> None:
+    now = _time.time()
+    expired = [k for k, v in _batch_sessions.items() if now - v["created_at"] > _BATCH_SESSION_TTL]
+    for k in expired:
+        del _batch_sessions[k]
+
+
+@router.post("/batch/init", status_code=200)
+async def init_batch(
+    as26_file: UploadFile = File(...),
+    financial_year: str = Form(default=settings.DEFAULT_FINANCIAL_YEAR),
+    run_config_json: Optional[str] = Form(default=None),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Step 1 of chunked batch: upload 26AS only, get a batch_id back.
+    The 26AS bytes are stored in memory for subsequent add-party calls.
+    """
+    _purge_batch_sessions()
+
+    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+    as26_bytes = await as26_file.read()
+    if len(as26_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"26AS file exceeds {settings.MAX_UPLOAD_MB}MB limit")
+
+    run_config: Optional[dict] = None
+    if run_config_json:
+        try:
+            run_config = _json.loads(run_config_json)
+        except Exception:
+            raise HTTPException(status_code=422, detail="run_config_json must be valid JSON")
+
+    batch_id = str(uuid.uuid4())
+    _batch_sessions[batch_id] = {
+        "as26_bytes": as26_bytes,
+        "as26_filename": as26_file.filename or "26as.xlsx",
+        "financial_year": financial_year,
+        "run_config": run_config,
+        "user_id": current_user.id,
+        "created_at": _time.time(),
+        "runs": [],
+    }
+
+    return {"batch_id": batch_id, "status": "ready"}
+
+
+@router.post("/batch/{batch_id}/add", status_code=202)
+async def add_party_to_batch(
+    batch_id: str,
+    sap_file: UploadFile = File(...),
+    mappings_json: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Step 2 of chunked batch: upload ONE SAP file + its mapping.
+    Creates a placeholder run, starts processing immediately, returns run summary.
+    Call this once per SAP file.
+    """
+    session = _batch_sessions.get(batch_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Batch session not found or expired. Re-init with /batch/init.")
+
+    try:
+        parties: list = _json.loads(mappings_json)
+        if isinstance(parties, dict):
+            parties = [parties]
+    except Exception:
+        raise HTTPException(status_code=422, detail="mappings_json must be valid JSON")
+
+    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+    sap_bytes = await sap_file.read()
+    if len(sap_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{sap_file.filename} exceeds {settings.MAX_UPLOAD_MB}MB limit",
+        )
+
+    filename = sap_file.filename or "sap.xlsx"
+    as26_bytes = session["as26_bytes"]
+    as26_filename = session["as26_filename"]
+    financial_year = session["financial_year"]
+    run_config = session["run_config"]
+
+    run = await _create_placeholder_run(
+        db, current_user, sap_bytes, as26_bytes,
+        filename, as26_filename, financial_year, batch_id=batch_id,
+        deductor_filter_parties=parties if parties else None,
+    )
+    await db.commit()
+
+    task = asyncio.create_task(
+        _run_reconciliation_background(
+            run_id=run.id,
+            user_id=current_user.id,
+            sap_bytes=sap_bytes,
+            as26_bytes=as26_bytes,
+            sap_filename=filename,
+            as26_filename=as26_filename,
+            financial_year=financial_year,
+            batch_id=batch_id,
+            deductor_filter_parties=parties if parties else None,
+            run_config=run_config,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    run_summary = {
+        "run_id": run.id,
+        "run_number": run.run_number,
+        "sap_filename": filename,
+        "deductor_name": parties[0]["deductor_name"] if parties else None,
+        "status": "PROCESSING",
+    }
+    session["runs"].append(run_summary)
+
+    return {"batch_id": batch_id, "run": run_summary, "total_so_far": len(session["runs"])}
+
+
+# ── Batch: Run All (legacy — uploads everything at once) ─────────────────────
 
 @router.post("/batch", status_code=202)
 async def create_batch_run(
@@ -1199,10 +1575,29 @@ async def authorize_suggested_matches(
         if not sm:
             raise HTTPException(status_code=404, detail=f"Suggested match {sm_id} not found")
 
+        # Guard: prevent double-approve or approve-after-reject
+        if sm.authorized:
+            continue  # already authorized, skip silently
+        if sm.rejected:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Suggested match {sm_id} was already rejected and cannot be authorized",
+            )
+
         if sm.requires_remarks and not body.remarks:
             raise HTTPException(
                 status_code=400,
                 detail=f"Remarks are mandatory for suggested match {sm_id} (category: {sm.category})",
+            )
+
+        # Variance-based gate: >50% variance requires mandatory justification
+        if (sm.variance_pct or 0) > 50.0 and not body.remarks:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Suggested match {sm_id} has extreme variance ({sm.variance_pct:.1f}%). "
+                    f"Remarks/justification are mandatory for authorizing matches with >50% variance."
+                ),
             )
 
         # Mark as authorized
@@ -1289,27 +1684,52 @@ async def authorize_suggested_matches(
             select(func.count(Unmatched26AS.id)).where(Unmatched26AS.run_id == run_id)
         )
         run.unmatched_26as_count = unmatched_result.scalar() or 0
+        # ── Recount suggested_count (pending only — not authorized/rejected) ──
+        suggested_pending_result = await db.execute(
+            select(func.count(SuggestedMatch.id)).where(
+                SuggestedMatch.run_id == run_id,
+                SuggestedMatch.authorized == False,
+                SuggestedMatch.rejected == False,
+            )
+        )
+        run.suggested_count = suggested_pending_result.scalar() or 0
         if run.total_26as_entries and run.total_26as_entries > 0:
             run.match_rate_pct = (run.matched_count / run.total_26as_entries) * 100
-        # Update confidence counts
-        for sm_id in body.ids:
-            r2 = await db.execute(select(SuggestedMatch).where(SuggestedMatch.id == sm_id))
-            sm2 = r2.scalar_one_or_none()
-            if sm2:
-                conf = sm2.confidence.upper() if sm2.confidence else "LOW"
-                if conf == "HIGH":
-                    run.high_confidence_count = (run.high_confidence_count or 0) + 1
-                elif conf == "MEDIUM":
-                    run.medium_confidence_count = (run.medium_confidence_count or 0) + 1
-                else:
-                    run.low_confidence_count = (run.low_confidence_count or 0) + 1
+        # Recount confidence from authoritative MatchedPair rows (prevents double-counting)
+        conf_result = await db.execute(
+            select(MatchedPair.confidence, func.count(MatchedPair.id))
+            .where(MatchedPair.run_id == run_id)
+            .group_by(MatchedPair.confidence)
+        )
+        conf_map = {(row[0] or "LOW").upper(): row[1] for row in conf_result.all()}
+        run.high_confidence_count = conf_map.get("HIGH", 0)
+        run.medium_confidence_count = conf_map.get("MEDIUM", 0)
+        run.low_confidence_count = conf_map.get("LOW", 0)
         await db.flush()
+
+    # Build detailed audit metadata with before/after context per match
+    authorized_details = []
+    for sm_id in body.ids:
+        sm_r = await db.execute(select(SuggestedMatch).where(SuggestedMatch.id == sm_id))
+        sm_obj = sm_r.scalar_one_or_none()
+        if sm_obj and sm_obj.authorized:
+            authorized_details.append({
+                "id": sm_id,
+                "variance_pct": sm_obj.variance_pct,
+                "confidence": sm_obj.confidence,
+                "match_type": sm_obj.match_type,
+                "as26_amount": sm_obj.as26_amount,
+                "books_sum": sm_obj.books_sum,
+                "invoice_refs": sm_obj.invoice_refs,
+                "category": sm_obj.category,
+            })
 
     await log_event(db, "SUGGESTED_MATCHES_AUTHORIZED",
                     f"{success_count} suggested match(es) authorized and promoted to matched pairs by {current_user.full_name}",
                     run_id=run_id, user_id=current_user.id,
                     metadata={"ids": body.ids, "remarks": body.remarks, "count": success_count,
-                              "promoted_to_matched": promoted_count})
+                              "promoted_to_matched": promoted_count,
+                              "authorized_details": authorized_details})
 
     return {"success_count": success_count, "promoted_count": promoted_count}
 
@@ -1336,12 +1756,33 @@ async def reject_suggested_matches(
         if not sm:
             raise HTTPException(status_code=404, detail=f"Suggested match {sm_id} not found")
 
+        # Guard: prevent double-reject or reject-after-authorize
+        if sm.rejected:
+            continue  # already rejected, skip silently
+        if sm.authorized:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Suggested match {sm_id} was already authorized and cannot be rejected",
+            )
+
         sm.rejected = True
         sm.rejected_by_id = current_user.id
         sm.rejected_at = datetime.now(timezone.utc)
         sm.rejection_reason = body.reason
         success_count += 1
 
+    await db.flush()
+
+    # ── Recount suggested_count from actual DB state ──
+    run = await _get_run_or_404(run_id, db)
+    pending_result = await db.execute(
+        select(func.count(SuggestedMatch.id)).where(
+            SuggestedMatch.run_id == run_id,
+            SuggestedMatch.authorized == False,
+            SuggestedMatch.rejected == False,
+        )
+    )
+    run.suggested_count = pending_result.scalar() or 0
     await db.flush()
 
     await log_event(db, "SUGGESTED_MATCHES_REJECTED",
@@ -1422,11 +1863,16 @@ async def _create_placeholder_run(
     sap_hash = sha256_file(sap_bytes)
     as26_hash = sha256_file(as26_bytes)
 
-    result = await db.execute(select(RunCounter).where(RunCounter.id == 1))
+    # Atomic run number increment — use with_for_update() to prevent race conditions
+    # (SQLite serializes writes via WAL; PostgreSQL uses SELECT FOR UPDATE row lock)
+    result = await db.execute(
+        select(RunCounter).where(RunCounter.id == 1).with_for_update()
+    )
     counter = result.scalar_one_or_none()
     if not counter:
         counter = RunCounter(id=1, current_value=0)
         db.add(counter)
+        await db.flush()
     counter.current_value += 1
     await db.flush()
     run_num = counter.current_value
@@ -1506,28 +1952,30 @@ async def _run_reconciliation_background(
             except Exception as e:
                 logger.error(f"Background run {run_id} failed: {e}\n{traceback.format_exc()}")
                 await db.rollback()
-                # Mark run as FAILED in a fresh transaction
+                # Mark run as FAILED in a fresh transaction, with error message
+                err_msg = str(e)[:2000]  # Truncate to prevent overflow
                 try:
                     from sqlalchemy import text as sql_text
                     await db.execute(
-                        sql_text("UPDATE reconciliation_runs SET status='FAILED' WHERE id=:rid"),
-                        {"rid": run_id},
+                        sql_text("UPDATE reconciliation_runs SET status='FAILED', error_message=:err WHERE id=:rid"),
+                        {"rid": run_id, "err": err_msg},
                     )
                     await db.commit()
                 except Exception as e2:
                     logger.error(f"Failed to mark run {run_id} as FAILED: {e2}")
-                progress_store.mark_failed(run_id, str(e))
+                progress_store.mark_failed(run_id, err_msg)
     except Exception as outer:
         logger.error(f"Background task outer crash for run {run_id}: {outer}\n{traceback.format_exc()}")
-        progress_store.mark_failed(run_id, str(outer))
+        err_msg = str(outer)[:2000]
+        progress_store.mark_failed(run_id, err_msg)
         # Last resort: raw SQL to mark failed
         try:
             from db.base import AsyncSessionLocal as _ASL
             async with _ASL() as emergency_db:
                 from sqlalchemy import text as sql_text
                 await emergency_db.execute(
-                    sql_text("UPDATE reconciliation_runs SET status='FAILED' WHERE id=:rid"),
-                    {"rid": run_id},
+                    sql_text("UPDATE reconciliation_runs SET status='FAILED', error_message=:err WHERE id=:rid"),
+                    {"rid": run_id, "err": err_msg},
                 )
                 await emergency_db.commit()
         except Exception:
@@ -1550,6 +1998,8 @@ def _run_to_summary(r: ReconciliationRun) -> RunSummary:
         deductor_name=r.deductor_name, tan=r.tan, status=r.status,
         match_rate_pct=r.match_rate_pct, matched_count=r.matched_count,
         total_26as_entries=r.total_26as_entries,
+        total_sap_entries=r.total_sap_entries or 0,
+        suggested_count=r.suggested_count or 0,
         unmatched_26as_count=r.unmatched_26as_count,
         high_confidence_count=r.high_confidence_count,
         medium_confidence_count=r.medium_confidence_count,
@@ -1565,22 +2015,28 @@ def _run_to_summary(r: ReconciliationRun) -> RunSummary:
         completed_at=r.completed_at.isoformat() if r.completed_at else None,
         mode=r.mode,
         batch_id=r.batch_id,
+        error_message=r.error_message,
+        total_26as_amount=r.total_26as_amount or 0.0,
+        matched_amount=r.matched_amount or 0.0,
+        unmatched_26as_amount=r.unmatched_26as_amount or 0.0,
     )
 
 
 def _mp_to_dict(p: MatchedPair) -> dict:
+    refs = p.invoice_refs or []
     return {
-        "id": p.id, "as26_amount": p.as26_amount, "as26_date": p.as26_date,
-        "section": p.section, "books_sum": p.books_sum,
+        "id": p.id, "as26_index": p.as26_index, "as26_amount": p.as26_amount,
+        "as26_date": p.as26_date, "section": p.section, "books_sum": p.books_sum,
         "variance_pct": p.variance_pct, "variance_amt": p.variance_amt,
         "match_type": p.match_type, "confidence": p.confidence,
         "composite_score": p.composite_score,
+        "invoice_count": len(refs),
         "score_breakdown": {
             "variance": p.score_variance, "date_proximity": p.score_date_proximity,
             "section": p.score_section_match, "clearing_doc": p.score_clearing_doc,
             "historical": p.score_historical,
         },
-        "invoice_refs": p.invoice_refs, "invoice_amounts": p.invoice_amounts,
+        "invoice_refs": refs, "invoice_amounts": p.invoice_amounts,
         "invoice_dates": p.invoice_dates, "clearing_doc": p.clearing_doc,
         "cross_fy": p.cross_fy, "is_prior_year": p.is_prior_year,
         "ai_risk_flag": p.ai_risk_flag, "ai_risk_reason": p.ai_risk_reason,
@@ -1591,6 +2047,7 @@ def _mp_to_dict(p: MatchedPair) -> dict:
 def _exc_to_dict(e: ExceptionRecord) -> dict:
     return {
         "id": e.id, "exception_type": e.exception_type, "severity": e.severity,
+        "category": e.exception_type,
         "description": e.description, "amount": e.amount, "section": e.section,
         "reviewed": e.reviewed, "review_action": e.review_action,
         "review_notes": e.review_notes, "reviewed_at": e.reviewed_at.isoformat() if e.reviewed_at else None,

@@ -188,7 +188,12 @@ function NumberField({
         <input
           type="number"
           value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+          onChange={(e) => {
+            let v = parseFloat(e.target.value) || 0;
+            if (min != null && v < min) v = min;
+            if (max != null && v > max) v = max;
+            onChange(v);
+          }}
           min={min}
           max={max}
           step={step ?? 1}
@@ -302,9 +307,24 @@ function AlgorithmSettingsCard() {
   );
 
   const handleSave = () => {
-    if (draft) {
-      saveMut.mutate(draft);
+    if (!draft) return;
+    // Client-side validation guard
+    const numericChecks: Array<[string, number | undefined]> = [
+      ['Hard cutoff days', draft.date_hard_cutoff_days],
+      ['Soft preference days', draft.date_soft_preference_days],
+      ['Normal ceiling %', draft.variance_normal_ceiling_pct],
+      ['Suggested ceiling %', draft.variance_suggested_ceiling_pct],
+      ['Noise threshold', draft.noise_threshold],
+      ['Max combo size', draft.max_combo_size],
+      ['Cross-FY lookback', draft.cross_fy_lookback_years],
+    ];
+    for (const [label, val] of numericChecks) {
+      if (val != null && val < 0) {
+        toast('Validation error', `${label} cannot be negative`, 'error');
+        return;
+      }
     }
+    saveMut.mutate(draft);
   };
 
   const paramCount = 14;

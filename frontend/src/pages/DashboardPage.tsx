@@ -74,8 +74,12 @@ export default function DashboardPage() {
   // Chart data: last 10 completed runs sorted ascending
   const chartData = useMemo(() => {
     return [...runs]
-      .filter((r) => r.match_rate_pct != null && r.completed_at)
-      .sort((a, b) => new Date(a.completed_at!).getTime() - new Date(b.completed_at!).getTime())
+      .filter((r) => r.match_rate_pct != null && r.status !== 'PROCESSING' && r.status !== 'FAILED')
+      .sort((a, b) => {
+        const dateA = a.completed_at ? new Date(a.completed_at).getTime() : new Date(a.created_at).getTime();
+        const dateB = b.completed_at ? new Date(b.completed_at).getTime() : new Date(b.created_at).getTime();
+        return dateA - dateB;
+      })
       .slice(-10)
       .map((r) => ({
         label: `Run #${r.run_number}`,

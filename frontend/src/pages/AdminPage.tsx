@@ -268,6 +268,9 @@ function AlgorithmSettingsCard() {
         cross_fy_lookback_years: settings.cross_fy_lookback_years,
         force_match_enabled: settings.force_match_enabled,
         noise_threshold: settings.noise_threshold,
+        clearing_group_enabled: settings.clearing_group_enabled,
+        clearing_group_variance_pct: settings.clearing_group_variance_pct,
+        proxy_clearing_enabled: settings.proxy_clearing_enabled,
       });
     }
   }, [settings, draft]);
@@ -293,6 +296,9 @@ function AlgorithmSettingsCard() {
         cross_fy_lookback_years: updated.cross_fy_lookback_years,
         force_match_enabled: updated.force_match_enabled,
         noise_threshold: updated.noise_threshold,
+        clearing_group_enabled: updated.clearing_group_enabled,
+        clearing_group_variance_pct: updated.clearing_group_variance_pct,
+        proxy_clearing_enabled: updated.proxy_clearing_enabled,
       });
     },
     onError: (err) => {
@@ -310,7 +316,7 @@ function AlgorithmSettingsCard() {
   const handleSave = () => {
     if (!draft) return;
     // Client-side validation guard
-    const numericChecks: Array<[string, number | undefined]> = [
+    const numericChecks: Array<[string, number | null | undefined]> = [
       ['Hard cutoff days', draft.date_hard_cutoff_days],
       ['Soft preference days', draft.date_soft_preference_days],
       ['Normal ceiling %', draft.variance_normal_ceiling_pct],
@@ -318,6 +324,7 @@ function AlgorithmSettingsCard() {
       ['Noise threshold', draft.noise_threshold],
       ['Max combo size', draft.max_combo_size],
       ['Cross-FY lookback', draft.cross_fy_lookback_years],
+      ['Clearing group variance %', draft.clearing_group_variance_pct],
     ];
     for (const [label, val] of numericChecks) {
       if (val != null && val < 0) {
@@ -328,7 +335,7 @@ function AlgorithmSettingsCard() {
     saveMut.mutate(draft);
   };
 
-  const paramCount = 14;
+  const paramCount = 17;
 
   return (
     <Card>
@@ -472,7 +479,7 @@ function AlgorithmSettingsCard() {
                   value={draft.max_combo_size ?? 5}
                   onChange={(v) => update('max_combo_size', v)}
                   min={0}
-                  helpText="Max invoices per combo match (0 = unlimited)"
+                  helpText="Max invoices per combo match (0 = use default 5)"
                 />
                 <NumberField
                   label="Noise threshold (Rs.)"
@@ -495,7 +502,41 @@ function AlgorithmSettingsCard() {
                 />
               </SettingsSection>
 
-              {/* Section 5: Cross-FY & Advances */}
+              {/* Section 5: Clearing Group Matching */}
+              <SettingsSection title="Clearing Group Matching">
+                <Toggle
+                  checked={draft.clearing_group_enabled ?? true}
+                  onChange={(v) => update('clearing_group_enabled', v)}
+                  label="Enable clearing group matching (Phase A)"
+                />
+                <p className="text-xs text-gray-400 -mt-2 ml-[52px]">
+                  When disabled, all entries skip directly to individual matching. Useful when SAP clearing doc values are unreliable.
+                </p>
+                {(draft.clearing_group_enabled ?? true) && (
+                  <>
+                    <NumberField
+                      label="Clearing group variance ceiling %"
+                      value={draft.clearing_group_variance_pct ?? draft.variance_normal_ceiling_pct ?? 3.0}
+                      onChange={(v) => update('clearing_group_variance_pct', v)}
+                      min={0}
+                      max={100}
+                      step={0.1}
+                      suffix="%"
+                      helpText="Dedicated variance cap for clearing group matches (separate from individual matching)"
+                    />
+                    <Toggle
+                      checked={draft.proxy_clearing_enabled ?? true}
+                      onChange={(v) => update('proxy_clearing_enabled', v)}
+                      label="Enable proxy clearing fallback"
+                    />
+                    <p className="text-xs text-gray-400 -mt-2 ml-[52px]">
+                      When clearing doc coverage is low (&lt;10%), cluster books by date as proxy groups.
+                    </p>
+                  </>
+                )}
+              </SettingsSection>
+
+              {/* Section 6: Cross-FY & Advances */}
               <SettingsSection title="Cross-FY & Advances">
                 <Toggle
                   checked={draft.exclude_sgl_v ?? false}

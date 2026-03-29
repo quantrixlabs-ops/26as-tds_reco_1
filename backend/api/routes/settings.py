@@ -38,6 +38,9 @@ class AdminSettingsSchema(BaseModel):
     cross_fy_lookback_years: int
     force_match_enabled: bool
     noise_threshold: float
+    clearing_group_enabled: bool
+    clearing_group_variance_pct: Optional[float] = None
+    proxy_clearing_enabled: bool
     updated_at: Optional[str] = None
 
     class Config:
@@ -60,6 +63,9 @@ class AdminSettingsUpdate(BaseModel):
     cross_fy_lookback_years: Optional[int] = None
     force_match_enabled: Optional[bool] = None
     noise_threshold: Optional[float] = None
+    clearing_group_enabled: Optional[bool] = None
+    clearing_group_variance_pct: Optional[float] = None
+    proxy_clearing_enabled: Optional[bool] = None
 
     from pydantic import field_validator
 
@@ -76,7 +82,7 @@ class AdminSettingsUpdate(BaseModel):
 
     @field_validator(
         "variance_normal_ceiling_pct", "variance_suggested_ceiling_pct",
-        "noise_threshold",
+        "noise_threshold", "clearing_group_variance_pct",
         mode="before",
     )
     @classmethod
@@ -85,7 +91,7 @@ class AdminSettingsUpdate(BaseModel):
             raise ValueError("Value must be non-negative")
         return v
 
-    @field_validator("variance_normal_ceiling_pct", "variance_suggested_ceiling_pct", mode="before")
+    @field_validator("variance_normal_ceiling_pct", "variance_suggested_ceiling_pct", "clearing_group_variance_pct", mode="before")
     @classmethod
     def _pct_max_100(cls, v):
         if v is not None and v > 100:
@@ -109,6 +115,7 @@ _SETTINGS_FIELDS = [
     "exclude_sgl_v", "max_combo_size", "date_clustering_preference",
     "allow_cross_fy", "cross_fy_lookback_years", "force_match_enabled",
     "noise_threshold",
+    "clearing_group_enabled", "clearing_group_variance_pct", "proxy_clearing_enabled",
 ]
 
 
@@ -140,12 +147,15 @@ def _to_schema(s: AdminSettings) -> dict:
         "variance_normal_ceiling_pct": s.variance_normal_ceiling_pct if s.variance_normal_ceiling_pct is not None else 3.0,
         "variance_suggested_ceiling_pct": s.variance_suggested_ceiling_pct if s.variance_suggested_ceiling_pct is not None else 20.0,
         "exclude_sgl_v": s.exclude_sgl_v if s.exclude_sgl_v is not None else True,
-        "max_combo_size": s.max_combo_size if s.max_combo_size is not None else 0,
+        "max_combo_size": s.max_combo_size if s.max_combo_size is not None else 5,
         "date_clustering_preference": s.date_clustering_preference if s.date_clustering_preference is not None else True,
         "allow_cross_fy": s.allow_cross_fy if s.allow_cross_fy is not None else False,
         "cross_fy_lookback_years": s.cross_fy_lookback_years if s.cross_fy_lookback_years is not None else 1,
         "force_match_enabled": s.force_match_enabled if s.force_match_enabled is not None else True,
         "noise_threshold": s.noise_threshold if s.noise_threshold is not None else 1.0,
+        "clearing_group_enabled": s.clearing_group_enabled if s.clearing_group_enabled is not None else True,
+        "clearing_group_variance_pct": s.clearing_group_variance_pct,
+        "proxy_clearing_enabled": s.proxy_clearing_enabled if s.proxy_clearing_enabled is not None else True,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }
 
@@ -175,12 +185,12 @@ async def update_settings(
     old = await _get_or_create_active(db)
     old.is_active = False
 
-    # Build new settings: start with old values, overlay any provided updates
+    # Build new settings: start with old values, overlay any provided updates.
+    # Use model_fields_set to distinguish "not sent" from "explicitly set to null".
     new_data = {}
     for col in _SETTINGS_FIELDS:
-        new_val = getattr(body, col, None)
-        if new_val is not None:
-            new_data[col] = new_val
+        if col in body.model_fields_set:
+            new_data[col] = getattr(body, col)
         else:
             new_data[col] = getattr(old, col)
 

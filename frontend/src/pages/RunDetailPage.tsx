@@ -309,11 +309,6 @@ function MatchedTab({ runId }: { runId: string }) {
   const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set());
   const [selectedConfidence, setSelectedConfidence] = useState<Set<string>>(new Set());
 
-  // Variance range slider state
-  const [varMin, setVarMin] = useState(0);
-  const [varMax, setVarMax] = useState(100);
-  const dataVarMax = data.length > 0 ? Math.ceil(Math.max(...data.map((r) => r.variance_pct), 1)) : 100;
-  const varRangeActive = varMin > 0 || varMax < dataVarMax;
 
   // Sort state
   type SortKey = 'as26_index' | 'as26_date' | 'section' | 'as26_amount' | 'books_sum' | 'variance_pct' | 'match_type' | 'confidence' | 'invoice_count';
@@ -333,7 +328,6 @@ function MatchedTab({ runId }: { runId: string }) {
     (selectedSections.size > 0 ? 1 : 0) +
     (selectedTypes.size > 0 ? 1 : 0) +
     (selectedConfidence.size > 0 ? 1 : 0) +
-    (varRangeActive ? 1 : 0) +
     (globalSearch ? 1 : 0);
 
   const clearAllFilters = () => {
@@ -341,8 +335,6 @@ function MatchedTab({ runId }: { runId: string }) {
     setSelectedSections(new Set());
     setSelectedTypes(new Set());
     setSelectedConfidence(new Set());
-    setVarMin(0);
-    setVarMax(dataVarMax);
     setGlobalSearch('');
   };
 
@@ -369,7 +361,6 @@ function MatchedTab({ runId }: { runId: string }) {
     if (selectedSections.size > 0 && !selectedSections.has(r.section)) return false;
     if (selectedTypes.size > 0 && !selectedTypes.has(r.match_type)) return false;
     if (selectedConfidence.size > 0 && !selectedConfidence.has(r.confidence)) return false;
-    if (varRangeActive && (r.variance_pct < varMin || r.variance_pct > varMax)) return false;
     return true;
   });
 
@@ -477,51 +468,6 @@ function MatchedTab({ runId }: { runId: string }) {
           <DropdownFilter label="Section" options={sectionOptions} selected={selectedSections} onChange={setSelectedSections} />
           <DropdownFilter label="Type" options={typeOptions} selected={selectedTypes} onChange={setSelectedTypes} />
           <DropdownFilter label="Confidence" options={confidenceOptions} selected={selectedConfidence} onChange={setSelectedConfidence} />
-          {/* Variance range slider */}
-          <div className={cn(
-            'flex items-center gap-2 px-2.5 py-1 rounded-lg border text-xs',
-            varRangeActive
-              ? 'bg-[#1B3A5C] text-white border-[#1B3A5C]'
-              : 'bg-white text-gray-600 border-gray-200',
-          )}>
-            <span className="font-medium whitespace-nowrap">Var %</span>
-            <input
-              type="range"
-              min={0}
-              max={dataVarMax}
-              step={0.5}
-              value={varMin}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                setVarMin(Math.min(v, varMax));
-              }}
-              className="w-16 h-1 accent-[#1B3A5C] cursor-pointer"
-            />
-            <span className="font-mono text-[10px] w-16 text-center tabular-nums">
-              {varMin.toFixed(1)}–{varMax.toFixed(1)}%
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={dataVarMax}
-              step={0.5}
-              value={varMax}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                setVarMax(Math.max(v, varMin));
-              }}
-              className="w-16 h-1 accent-[#1B3A5C] cursor-pointer"
-            />
-            {varRangeActive && (
-              <button
-                type="button"
-                onClick={() => { setVarMin(0); setVarMax(dataVarMax); }}
-                className="text-white/70 hover:text-white"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            )}
-          </div>
         </div>
       </div>
 
@@ -771,6 +717,8 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
   const filtered = reasonFilter ? data.filter((r) => r.reason_code === reasonFilter) : data;
   const filteredAmount = filtered.reduce((sum, r) => sum + (r.amount || 0), 0);
 
+  const [showLegend, setShowLegend] = useState(false);
+
   return (
     <Card padding={false}>
       <div className="px-4 py-3 border-b border-gray-100 space-y-2">
@@ -783,12 +731,37 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
                 : <>{data.length} unmatched 26AS entries</>}
             </p>
           </div>
-          {data.length > 0 && (
-            <p className="text-sm font-semibold text-red-600">
-              Total exposure: {formatCurrency(totalAmount)}
-            </p>
-          )}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowLegend(!showLegend)}
+              className="text-xs text-[#1B3A5C] font-medium hover:underline flex items-center gap-1"
+            >
+              <BookOpen className="h-3 w-3" />
+              {showLegend ? 'Hide legend' : 'Reason code legend'}
+            </button>
+            {data.length > 0 && (
+              <p className="text-sm font-semibold text-red-600">
+                Total exposure: {formatCurrency(totalAmount)}
+              </p>
+            )}
+          </div>
         </div>
+        {showLegend && (
+          <div className="p-2.5 bg-gray-50 rounded-lg border border-gray-100 space-y-1.5">
+            <div className="flex items-start gap-2">
+              <span className="font-mono text-xs text-red-600 w-8 shrink-0 font-semibold">U01</span>
+              <span className="text-xs text-gray-600">No matching invoice found in SAP at any threshold — no candidate even close.</span>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="font-mono text-xs text-red-600 w-8 shrink-0 font-semibold">U02</span>
+              <span className="text-xs text-gray-600">Candidate invoice(s) existed but were consumed by other, higher-scoring matches first.</span>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="font-mono text-xs text-red-600 w-8 shrink-0 font-semibold">U04</span>
+              <span className="text-xs text-gray-600">Below noise threshold (amount &lt; Rs.1) — excluded from matching as immaterial.</span>
+            </div>
+          </div>
+        )}
         {reasonCodes.length > 1 && (
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-400">Filter by reason:</span>
@@ -1333,26 +1306,42 @@ function AuditTrailTab({ runId, runStatus }: { runId: string; runStatus?: string
         {data.length === 0 && (
           <p className="text-sm text-gray-400 text-center py-8">No audit events yet</p>
         )}
-        {data.map((event) => (
-          <div key={event.id} className="flex gap-4">
-            <div className="flex flex-col items-center">
-              <div className="w-2 h-2 rounded-full bg-[#1B3A5C] mt-1" />
-              <div className="w-px flex-1 bg-gray-100 mt-1" />
-            </div>
-            <div className="flex-1 pb-4">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-medium text-gray-900">{event.event_type}</span>
-                <Badge variant="gray" size="sm">{event.actor_role}</Badge>
+        {data.map((event) => {
+          const HIGH_SIG = new Set([
+            'RUN_CREATED', 'RERUN_CREATED', 'RUN_APPROVED', 'RUN_REJECTED',
+            'REVIEW_APPROVED', 'REVIEW_REJECTED', 'SUGGESTED_AUTHORIZED',
+            'SUGGESTED_REJECTED', 'RUN_FAILED',
+          ]);
+          const isHigh = HIGH_SIG.has(event.event_type);
+          const isApproval = event.event_type.includes('APPROVED');
+          const isRejection = event.event_type.includes('REJECTED') || event.event_type === 'RUN_FAILED';
+          const dotColor = isApproval ? 'bg-emerald-500' : isRejection ? 'bg-red-500' : isHigh ? 'bg-[#1B3A5C]' : 'bg-gray-300';
+          const eventBadgeVariant = isApproval ? 'green' as const : isRejection ? 'red' as const : 'gray' as const;
+
+          return (
+            <div key={event.id} className="flex gap-4">
+              <div className="flex flex-col items-center">
+                <div className={cn('w-2 h-2 rounded-full mt-1', dotColor)} />
+                <div className="w-px flex-1 bg-gray-100 mt-1" />
               </div>
-              <p className="text-xs text-gray-500 mt-0.5">
-                {event.actor} · {formatDateTime(event.timestamp)}
-              </p>
-              {event.notes && (
-                <p className="text-xs text-gray-600 mt-1 italic">"{event.notes}"</p>
-              )}
+              <div className="flex-1 pb-4">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={cn(
+                    'text-sm',
+                    isHigh ? 'font-semibold text-gray-900' : 'font-normal text-gray-500',
+                  )}>{event.event_type}</span>
+                  <Badge variant={eventBadgeVariant} size="sm">{event.actor_role}</Badge>
+                </div>
+                <p className={cn('text-xs mt-0.5', isHigh ? 'text-gray-600' : 'text-gray-400')}>
+                  {event.actor} · {formatDateTime(event.timestamp)}
+                </p>
+                {event.notes && (
+                  <p className="text-xs text-gray-600 mt-1 italic">"{event.notes}"</p>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </Card>
   );

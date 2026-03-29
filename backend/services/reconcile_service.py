@@ -103,6 +103,9 @@ async def _load_match_config(
             cross_fy_lookback_years=admin_settings.cross_fy_lookback_years if admin_settings.cross_fy_lookback_years is not None else 1,
             force_match_enabled=admin_settings.force_match_enabled if admin_settings.force_match_enabled is not None else True,
             noise_threshold=admin_settings.noise_threshold if admin_settings.noise_threshold is not None else 1.0,
+            clearing_group_enabled=admin_settings.clearing_group_enabled if admin_settings.clearing_group_enabled is not None else True,
+            clearing_group_variance_pct=admin_settings.clearing_group_variance_pct,
+            proxy_clearing_enabled=admin_settings.proxy_clearing_enabled if admin_settings.proxy_clearing_enabled is not None else True,
         )
     else:
         match_cfg = MatchConfig()
@@ -628,6 +631,12 @@ async def run_reconciliation(
         run.has_duplicate_26as = val_report.duplicates_found > 0
         run.completed_at = datetime.now(timezone.utc)
 
+        # ── Recount suggested_count from DB for accuracy ─────────────────
+        await db.flush()
+        run.suggested_count = await db.scalar(
+            select(func.count(SuggestedMatch.id)).where(SuggestedMatch.run_id == run.id)
+        ) or 0
+
         # ── Count invariant check ──────────────────────────────────────────
         _check_count_invariant(
             matched_results, suggested_results, unmatched_entries,
@@ -982,6 +991,12 @@ async def run_reconciliation_on_existing_run(
         run.completed_at = datetime.now(timezone.utc)
         run.config_snapshot = _config_snapshot(match_cfg)
         run.run_config = match_cfg.to_dict()
+
+        # ── Recount suggested_count from DB for accuracy ─────────────────
+        await db.flush()
+        run.suggested_count = await db.scalar(
+            select(func.count(SuggestedMatch.id)).where(SuggestedMatch.run_id == run.id)
+        ) or 0
 
         # ── Count invariant check ──────────────────────────────────────────
         _check_count_invariant(

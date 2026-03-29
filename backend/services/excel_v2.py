@@ -1,13 +1,15 @@
 """
 Excel Generator v2 — enterprise-grade output with full audit metadata.
-New sheets: Summary (with run ID, hashes, algorithm version, control totals),
-            Matched Pairs (with composite score breakdown),
-            Exceptions (REQUIRES REVIEW),
-            + existing Unmatched / Variance sheets.
+Sheets: Summary (with run ID, hashes, algorithm version, control totals),
+        Matched Pairs (with composite score breakdown),
+        Suggested Matches (requires authorization),
+        Exceptions (REQUIRES REVIEW),
+        Unmatched 26AS / Unmatched Books / Variance Analysis.
 """
 from __future__ import annotations
 
 import io
+import re
 from datetime import datetime, timezone
 from typing import List
 
@@ -15,7 +17,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from db.models import ReconciliationRun, MatchedPair, Unmatched26AS, UnmatchedBook, ExceptionRecord
+from db.models import ReconciliationRun, MatchedPair, Unmatched26AS, UnmatchedBook, ExceptionRecord, SuggestedMatch
 from core.settings import settings
 
 # Colour palette
@@ -29,9 +31,22 @@ CONF_HIGH = "C8F7C5"
 CONF_MED  = "FFF9C4"
 CONF_LOW  = "FFCCBC"
 ORANGE    = "FF6B35"
+AMBER     = "F59E0B"
 PURPLE    = "7B2D8B"
 GRAY_LIGHT= "F5F5F5"
+GRAY_SEP  = "EEEEEE"
 CRITICAL_RED = "C62828"
+
+# Category colours for suggested matches
+CAT_COLORS = {
+    "FORCE": "E53935",
+    "HIGH_VARIANCE_20_PLUS": "C62828",
+    "HIGH_VARIANCE_3_20": "FB8C00",
+    "DATE_SOFT_PREFERENCE": "1565C0",
+    "ADVANCE_PAYMENT": "7B2D8B",
+    "CROSS_FY": "D84315",
+    "TIER_CAP_EXCEEDED": "6D4C41",
+}
 
 
 def _fill(hex_color: str):
@@ -51,12 +66,48 @@ def _border():
     return Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
+def _write_title_header_sep(ws, title: str, headers: list, merge_end_col: str, title_fill: str = NAVY):
+    """Write a standard 3-row header block: title (row 1), headers (row 2), separator (row 3).
+
+    Data should start at row 4.  Freeze pane is set to A4.
+    """
+    num_cols = len(headers)
+    end_col = get_column_letter(num_cols)
+
+    # Row 1: merged title
+    ws.merge_cells(f"A1:{end_col}1")
+    ws["A1"] = title
+    ws["A1"].font = Font(bold=True, color=WHITE, size=11, name="Calibri")
+    ws["A1"].fill = _fill(title_fill)
+    ws["A1"].alignment = _align("center")
+    ws.row_dimensions[1].height = 26
+
+    # Row 2: column headers
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(2, c, h)
+        cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
+        cell.fill = _fill(NAVY)
+        cell.alignment = _align("center")
+
+    # Row 3: thin separator — prevents merge/freeze interaction that hides row 4 in some viewers
+    ws.row_dimensions[3].height = 6
+    for c in range(1, num_cols + 1):
+        ws.cell(3, c).fill = _fill(GRAY_SEP)
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A4"
+
+
+# ── Single-run Excel ─────────────────────────────────────────────────────────
+
 def generate_excel_v2(
     run: ReconciliationRun,
     matched_pairs: List[MatchedPair],
     unmatched_26as: List[Unmatched26AS],
     unmatched_books: List[UnmatchedBook],
     exceptions: List[ExceptionRecord],
+    suggested_matches: List[SuggestedMatch] | None = None,
+    variance_thresholds: tuple[float, float] = (1.0, 3.0),
 ) -> bytes:
     # Deduplicate matched pairs by as26_row_hash (safety net)
     seen_hashes: set = set()
@@ -78,8 +129,14 @@ def generate_excel_v2(
     ws_exc = wb.create_sheet("⚠ Requires Review")
     _build_exceptions(ws_exc, exceptions)
 
+    var_green, var_yellow = variance_thresholds
+
     ws_match = wb.create_sheet("Matched Pairs")
-    _build_matched(ws_match, matched_pairs, run)
+    _build_matched(ws_match, matched_pairs, run, var_green=var_green, var_yellow=var_yellow)
+
+    if suggested_matches:
+        ws_sug = wb.create_sheet("Suggested Matches")
+        _build_suggested(ws_sug, suggested_matches, run, var_green=var_green, var_yellow=var_yellow)
 
     ws_un26 = wb.create_sheet("Unmatched 26AS")
     _build_unmatched_26as(ws_un26, unmatched_26as)
@@ -87,8 +144,9 @@ def generate_excel_v2(
     ws_unbks = wb.create_sheet("Unmatched SAP Books")
     _build_unmatched_books(ws_unbks, unmatched_books)
 
-    ws_var = wb.create_sheet("Variance Analysis")
-    _build_variance(ws_var, matched_pairs)
+    if matched_pairs:
+        ws_var = wb.create_sheet("Variance Analysis")
+        _build_variance(ws_var, matched_pairs)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -143,6 +201,8 @@ def _build_summary(ws, run: ReconciliationRun, matched, unmatched_26as, exceptio
     metrics = [
         ("Total 26AS Entries", total, None),
         ("Matched", run.matched_count, VAR_GREEN),
+        ("Suggested (Requires Authorization)", run.suggested_count or 0,
+         VAR_YELLOW if (run.suggested_count or 0) > 0 else VAR_GREEN),
         ("Unmatched 26AS", run.unmatched_26as_count, VAR_RED if run.unmatched_26as_count > 0 else VAR_GREEN),
         ("Match Rate", f"{run.match_rate_pct:.2f}%", rate_color),
         ("HIGH Confidence", run.high_confidence_count, CONF_HIGH),
@@ -192,28 +252,20 @@ def _build_summary(ws, run: ReconciliationRun, matched, unmatched_26as, exceptio
 
 
 def _build_exceptions(ws, exceptions: List[ExceptionRecord]):
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A3"
-
-    ws.merge_cells("A1:G1")
-    ws["A1"] = "⚠ REQUIRES REVIEW — All items below need mandatory CA review before sign-off"
-    ws["A1"].font = Font(bold=True, color=WHITE, size=12, name="Calibri")
-    ws["A1"].fill = _fill(ORANGE)
-    ws["A1"].alignment = _align("center")
-    ws.row_dimensions[1].height = 25
-
     headers = ["#", "Type", "Severity", "Amount (₹)", "Section", "Description", "Status"]
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(2, c, h)
-        cell.font = Font(bold=True, color=WHITE, size=10, name="Calibri")
-        cell.fill = _fill(NAVY)
-        cell.alignment = _align("center")
+    _write_title_header_sep(
+        ws,
+        "⚠ REQUIRES REVIEW — All items below need mandatory CA review before sign-off",
+        headers,
+        get_column_letter(len(headers)),
+        title_fill=ORANGE,
+    )
 
     sev_colors = {"CRITICAL": "C62828", "HIGH": "E53935", "MEDIUM": "FB8C00", "LOW": "F9A825"}
 
-    for r, exc in enumerate(exceptions, 3):
+    for r, exc in enumerate(exceptions, 4):
         sev_color = sev_colors.get(exc.severity, "888888")
-        ws.cell(r, 1, r - 2).alignment = _align("center")
+        ws.cell(r, 1, r - 3).alignment = _align("center")
         ws.cell(r, 2, exc.exception_type.replace("_", " "))
         ws.cell(r, 3, exc.severity).fill = _fill(sev_color)
         ws.cell(r, 3).font = Font(bold=True, color=WHITE, size=9, name="Calibri")
@@ -230,38 +282,30 @@ def _build_exceptions(ws, exceptions: List[ExceptionRecord]):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-def _build_matched(ws, pairs: List[MatchedPair], run: ReconciliationRun):
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A3"
-
-    ws.merge_cells("A1:O1")
-    ws["A1"] = f"Matched Pairs — {run.deductor_name} | {run.financial_year} | Algorithm {run.algorithm_version}"
-    ws["A1"].font = Font(bold=True, color=WHITE, size=11, name="Calibri")
-    ws["A1"].fill = _fill(NAVY)
-    ws["A1"].alignment = _align("center")
-
+def _build_matched(ws, pairs: List[MatchedPair], run: ReconciliationRun,
+                   var_green: float = 1.0, var_yellow: float = 3.0):
     headers = [
         "#", "26AS Date", "Section", "26AS Amount (₹)", "Books Sum (₹)",
         "Variance ₹", "Variance %", "Match Type", "Confidence",
         "Composite Score", "Invoice Refs", "Clearing Doc",
-        "Cross-FY", "AI Risk", "Prior Year"
+        "Cross-FY", "AI Risk", "Prior Year", "Rate ⚠",
     ]
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(2, c, h)
-        cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
-        cell.fill = _fill(NAVY)
-        cell.alignment = _align("center")
+    title = (
+        f"Matched Pairs — {run.deductor_name} | Run #{run.run_number} "
+        f"| {run.financial_year} | Algorithm {run.algorithm_version}"
+    )
+    _write_title_header_sep(ws, title, headers, get_column_letter(len(headers)))
 
     conf_colors = {"HIGH": CONF_HIGH, "MEDIUM": CONF_MED, "LOW": CONF_LOW}
 
-    for r, p in enumerate(pairs, 3):
+    for r, p in enumerate(pairs, 4):
         conf_color = conf_colors.get(p.confidence or "", "FFFFFF")
         var_pct = p.variance_pct or 0
         score = p.composite_score or 0
-        var_color = VAR_GREEN if var_pct <= 1 else VAR_YELLOW if var_pct <= 3 else VAR_RED
+        var_color = VAR_GREEN if var_pct <= var_green else VAR_YELLOW if var_pct <= var_yellow else VAR_RED
         score_color = CONF_HIGH if score >= 80 else CONF_MED if score >= 60 else CONF_LOW
 
-        ws.cell(r, 1, r - 2).alignment = _align("center")
+        ws.cell(r, 1, r - 3).alignment = _align("center")
         ws.cell(r, 2, p.as26_date or "—")
         ws.cell(r, 3, p.section or "—").alignment = _align("center")
         ws.cell(r, 4, p.as26_amount or 0).number_format = '#,##0.00'
@@ -276,64 +320,102 @@ def _build_matched(ws, pairs: List[MatchedPair], run: ReconciliationRun):
         ws.cell(r, 13, "Y" if p.cross_fy else "").alignment = _align("center")
         ws.cell(r, 14, "!" if p.ai_risk_flag else "").alignment = _align("center")
         ws.cell(r, 15, "Y" if p.is_prior_year else "").alignment = _align("center")
+        # Rate mismatch flag (Fix 5)
+        rate_cell = ws.cell(r, 16, "⚠" if p.rate_mismatch else "")
+        rate_cell.alignment = _align("center")
+        if p.rate_mismatch:
+            rate_cell.fill = _fill(VAR_RED)
 
-    widths = [5, 14, 10, 16, 16, 14, 12, 18, 11, 14, 35, 16, 10, 9, 12]
+    widths = [5, 14, 10, 16, 16, 14, 12, 18, 11, 14, 35, 16, 10, 9, 12, 9]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def _build_suggested(ws, suggestions: List[SuggestedMatch], run: ReconciliationRun,
+                     var_green: float = 1.0, var_yellow: float = 3.0):
+    """Build a 'Requires Authorization' sheet for suggested matches."""
+    headers = [
+        "#", "Category", "26AS Date", "Section", "26AS Amount (₹)", "Books Sum (₹)",
+        "Variance ₹", "Variance %", "Match Type", "Confidence", "Composite Score",
+        "Invoice Refs", "Status", "Alert",
+    ]
+    title = (
+        f"Suggested Matches — {run.deductor_name} | Run #{run.run_number} "
+        f"| {run.financial_year}"
+    )
+    _write_title_header_sep(ws, title, headers, get_column_letter(len(headers)), title_fill=AMBER)
+
+    conf_colors = {"HIGH": CONF_HIGH, "MEDIUM": CONF_MED, "LOW": CONF_LOW}
+
+    for r, s in enumerate(suggestions, 4):
+        conf_color = conf_colors.get(s.confidence or "", "FFFFFF")
+        var_pct = s.variance_pct or 0
+        score = s.composite_score or 0
+        var_color = VAR_GREEN if var_pct <= var_green else VAR_YELLOW if var_pct <= var_yellow else VAR_RED
+        cat_color = CAT_COLORS.get(s.category, "888888")
+
+        ws.cell(r, 1, r - 3).alignment = _align("center")
+        cat_cell = ws.cell(r, 2, (s.category or "—").replace("_", " "))
+        cat_cell.fill = _fill(cat_color)
+        cat_cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
+        ws.cell(r, 3, s.as26_date or "—")
+        ws.cell(r, 4, s.section or "—").alignment = _align("center")
+        ws.cell(r, 5, s.as26_amount or 0).number_format = '#,##0.00'
+        ws.cell(r, 6, s.books_sum or 0).number_format = '#,##0.00'
+        ws.cell(r, 7, s.variance_amt or 0).fill = _fill(var_color); ws.cell(r, 7).number_format = '#,##0.00'
+        ws.cell(r, 8, f"{var_pct:.2f}%").fill = _fill(var_color)
+        ws.cell(r, 9, s.match_type or "—")
+        ws.cell(r, 10, s.confidence or "—").fill = _fill(conf_color)
+        ws.cell(r, 11, f"{score:.1f}")
+        ws.cell(r, 12, ", ".join(s.invoice_refs or []))
+        # Status
+        if s.authorized:
+            status_text, status_fill = "✓ Authorized", VAR_GREEN
+        elif s.rejected:
+            status_text, status_fill = "✗ Rejected", VAR_RED
+        else:
+            status_text, status_fill = "⏳ Pending", VAR_YELLOW
+        ws.cell(r, 13, status_text).fill = _fill(status_fill)
+        ws.cell(r, 14, s.alert_message or "").alignment = _align("left", wrap=True)
+        ws.row_dimensions[r].height = 30
+
+    widths = [5, 22, 14, 10, 16, 16, 14, 12, 18, 11, 14, 35, 14, 40]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
 def _build_unmatched_26as(ws, entries: List[Unmatched26AS]):
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A3"
+    headers = ["#", "Deductor", "TAN", "Date", "Amount (₹)", "Section",
+               "Nearest Invoice", "Nearest Var %", "Reason"]
+    _write_title_header_sep(ws, "Unmatched Form 26AS Entries", headers,
+                            get_column_letter(len(headers)), title_fill="B71C1C")
 
-    ws.merge_cells("A1:G1")
-    ws["A1"] = "Unmatched Form 26AS Entries"
-    ws["A1"].font = Font(bold=True, color=WHITE, size=11, name="Calibri")
-    ws["A1"].fill = _fill("B71C1C")
-    ws["A1"].alignment = _align("center")
-
-    headers = ["#", "Deductor", "TAN", "Date", "Amount (₹)", "Section", "Reason"]
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(2, c, h)
-        cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
-        cell.fill = _fill(NAVY)
-        cell.alignment = _align("center")
-
-    for r, e in enumerate(entries, 3):
-        ws.cell(r, 1, r - 2).alignment = _align("center")
+    for r, e in enumerate(entries, 4):
+        ws.cell(r, 1, r - 3).alignment = _align("center")
         ws.cell(r, 2, e.deductor_name)
         ws.cell(r, 3, e.tan).alignment = _align("center")
         ws.cell(r, 4, e.transaction_date)
         ws.cell(r, 5, e.amount).number_format = '#,##0.00'
         ws.cell(r, 5).fill = _fill(VAR_RED)
         ws.cell(r, 6, e.section).alignment = _align("center")
-        ws.cell(r, 7, f"[{e.reason_code}] {e.reason_detail}").alignment = _align("left", wrap=True)
+        ws.cell(r, 7, getattr(e, 'best_candidate_invoice', None) or "—")
+        bv = getattr(e, 'best_candidate_variance_pct', None)
+        ws.cell(r, 8, f"{bv:.1f}%" if bv is not None else "—").alignment = _align("center")
+        ws.cell(r, 9, f"[{e.reason_code}] {e.reason_detail}").alignment = _align("left", wrap=True)
         ws.row_dimensions[r].height = 30
 
-    widths = [5, 35, 14, 14, 16, 10, 60]
+    widths = [5, 35, 14, 14, 16, 10, 20, 12, 55]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
 def _build_unmatched_books(ws, entries: List[UnmatchedBook]):
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A3"
-
-    ws.merge_cells("A1:G1")
-    ws["A1"] = "Unmatched SAP Book Entries"
-    ws["A1"].font = Font(bold=True, color=WHITE, size=11, name="Calibri")
-    ws["A1"].fill = _fill("1565C0")
-    ws["A1"].alignment = _align("center")
-
     headers = ["#", "Invoice Ref", "Amount (₹)", "Doc Date", "Doc Type", "Clearing Doc", "Flags"]
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(2, c, h)
-        cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
-        cell.fill = _fill(NAVY)
-        cell.alignment = _align("center")
+    _write_title_header_sep(ws, "Unmatched SAP Book Entries", headers,
+                            get_column_letter(len(headers)), title_fill="1565C0")
 
-    for r, b in enumerate(entries, 3):
-        ws.cell(r, 1, r - 2).alignment = _align("center")
+    for r, b in enumerate(entries, 4):
+        ws.cell(r, 1, r - 3).alignment = _align("center")
         ws.cell(r, 2, b.invoice_ref)
         ws.cell(r, 3, b.amount).number_format = '#,##0.00'
         ws.cell(r, 4, b.doc_date or "—")
@@ -346,14 +428,19 @@ def _build_unmatched_books(ws, entries: List[UnmatchedBook]):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
+# ── Batch Excel ──────────────────────────────────────────────────────────────
+
 def generate_batch_excel(
     runs_data: List[dict],
+    variance_thresholds: tuple[float, float] = (1.0, 3.0),
 ) -> bytes:
     """Generate a combined Excel workbook for a batch of runs.
 
     Args:
         runs_data: list of dicts, each with keys:
-            run, matched_pairs, unmatched_26as, unmatched_books, exceptions
+            run, matched_pairs, unmatched_26as, unmatched_books, exceptions,
+            suggested_matches (optional)
+        variance_thresholds: (green_ceiling, yellow_ceiling) from admin config.
     Returns:
         Excel file bytes.
     """
@@ -367,6 +454,13 @@ def generate_batch_excel(
 
     first_run = runs_data[0]["run"] if runs_data else None
     fy_label = first_run.financial_year if first_run else "—"
+
+    summary_headers = [
+        "#", "Deductor", "TAN", "Status", "Match Rate",
+        "Matched", "Unmatched 26AS", "Total 26AS",
+        "Violations", "HIGH", "MEDIUM", "LOW",
+    ]
+
     ws_summary.merge_cells("A1:L1")
     ws_summary["A1"] = f"TDS BATCH RECONCILIATION SUMMARY — {fy_label}"
     ws_summary["A1"].font = Font(bold=True, color=WHITE, size=14, name="Calibri")
@@ -374,11 +468,6 @@ def generate_batch_excel(
     ws_summary["A1"].alignment = _align("center")
     ws_summary.row_dimensions[1].height = 30
 
-    summary_headers = [
-        "#", "Deductor", "TAN", "Status", "Match Rate",
-        "Matched", "Unmatched 26AS", "Total 26AS",
-        "Violations", "HIGH", "MEDIUM", "LOW",
-    ]
     for c, h in enumerate(summary_headers, 1):
         cell = ws_summary.cell(2, c, h)
         cell.font = Font(bold=True, color=WHITE, size=9, name="Calibri")
@@ -450,7 +539,10 @@ def generate_batch_excel(
     for i, w in enumerate(summary_widths, 1):
         ws_summary.column_dimensions[get_column_letter(i)].width = w
 
-    # ── Per-party matched-pairs sheets ──────────────────────────────────────
+    # ── Per-party sheets ─────────────────────────────────────────────────────
+    var_green = variance_thresholds[0]
+    var_yellow = variance_thresholds[1]
+
     for rd in runs_data:
         run: ReconciliationRun = rd["run"]
         # Deduplicate matched pairs by as26_row_hash (safety net against duplicate promotions)
@@ -467,8 +559,6 @@ def generate_batch_excel(
 
         # Excel sheet names max 31 chars, must be unique, no invalid chars
         raw_name = run.deductor_name or run.tan or f"Run-{run.run_number}"
-        # Remove chars invalid in Excel sheet names: \ / * ? : [ ]
-        import re
         safe_name = re.sub(r'[\\/*?:\[\]]', '_', raw_name)
         sheet_name = safe_name[:31]
         # Ensure uniqueness
@@ -478,7 +568,47 @@ def generate_batch_excel(
             sheet_name = safe_name[:31 - len(suffix)] + suffix
 
         ws = wb.create_sheet(sheet_name)
-        _build_matched(ws, matched_pairs, run)
+        _build_matched(ws, matched_pairs, run, var_green=var_green, var_yellow=var_yellow)
+
+        # Suggested matches sheet (only if any exist)
+        suggested: List[SuggestedMatch] = rd.get("suggested_matches", [])
+        if suggested:
+            sug_sheet_name = f"Review-{safe_name[:20]}"
+            existing = [ws.title for ws in wb.worksheets]
+            if sug_sheet_name in existing:
+                sug_sheet_name = f"Review-{safe_name[:14]} ({run.run_number})"
+            ws_sug = wb.create_sheet(sug_sheet_name)
+            _build_suggested(ws_sug, suggested, run, var_green=var_green, var_yellow=var_yellow)
+
+        # Unmatched 26AS sheet (only if any exist)
+        unmatched_26as: List[Unmatched26AS] = rd.get("unmatched_26as", [])
+        if unmatched_26as:
+            un_sheet_name = f"Unmatched-{safe_name[:18]}"
+            existing = [ws.title for ws in wb.worksheets]
+            if un_sheet_name in existing:
+                un_sheet_name = f"Unmatched-{safe_name[:12]} ({run.run_number})"
+            ws_un = wb.create_sheet(un_sheet_name)
+            _build_unmatched_26as(ws_un, unmatched_26as)
+
+        # Exceptions sheet (only if any exist)
+        exceptions: List[ExceptionRecord] = rd.get("exceptions", [])
+        if exceptions:
+            exc_sheet_name = f"Exceptions-{safe_name[:16]}"
+            existing = [ws.title for ws in wb.worksheets]
+            if exc_sheet_name in existing:
+                exc_sheet_name = f"Exceptions-{safe_name[:10]} ({run.run_number})"
+            ws_exc = wb.create_sheet(exc_sheet_name)
+            _build_exceptions(ws_exc, exceptions)
+
+        # Unmatched SAP Books sheet (only if any exist)
+        unmatched_books: List[UnmatchedBook] = rd.get("unmatched_books", [])
+        if unmatched_books:
+            bks_sheet_name = f"SAP-Unmtchd-{safe_name[:16]}"
+            existing = [ws.title for ws in wb.worksheets]
+            if bks_sheet_name in existing:
+                bks_sheet_name = f"SAP-Unmtchd-{safe_name[:10]} ({run.run_number})"
+            ws_bks = wb.create_sheet(bks_sheet_name)
+            _build_unmatched_books(ws_bks, unmatched_books)
 
     buf = io.BytesIO()
     wb.save(buf)

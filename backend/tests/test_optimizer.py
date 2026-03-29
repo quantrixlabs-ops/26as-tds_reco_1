@@ -343,3 +343,85 @@ def test_fy_boundary_detection():
     assert _is_fy_boundary_zone("15-Mar-2024") is True   # 16 days from Mar 31
     assert _is_fy_boundary_zone("10-Apr-2024") is True   # 10 days from Apr 1
     assert _is_fy_boundary_zone("20-Jun-2023") is False  # far from boundary
+
+
+# ── Clearing Group Config ─────────────────────────────────────────────────────
+
+def _clr_books(clearing_doc="CLR001"):
+    """3 books sharing one clearing doc, summing to 97,000 (3% var vs 100,000)."""
+    return [
+        _book(0, 40000.0, "INV-A", clearing_doc=clearing_doc),
+        _book(1, 32000.0, "INV-B", clearing_doc=clearing_doc),
+        _book(2, 25000.0, "INV-C", clearing_doc=clearing_doc),
+    ]
+
+
+def test_clearing_group_disabled_skips_phase_a():
+    """When clearing_group_enabled=False, no CLR_GROUP matches should appear."""
+    from config import MatchConfig
+    cfg = MatchConfig(clearing_group_enabled=False)
+    books = _clr_books()
+    as26 = [_as26(0, 100000.0)]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    for r in all_results:
+        assert not r.match_type.startswith("CLR_GROUP"), f"Unexpected CLR_GROUP match: {r.match_type}"
+
+
+def test_clearing_group_variance_tighter():
+    """Dedicated variance cap of 2% should reject a 3% clearing group."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        clearing_group_variance_pct=2.0,
+        variance_normal_ceiling_pct=3.0,
+    )
+    books = _clr_books()  # sums to 97,000 → 3% var vs 100,000
+    as26 = [_as26(0, 100000.0)]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    for r in all_results:
+        assert not r.match_type.startswith("CLR_GROUP"), "CLR_GROUP should not match at 3% when cap is 2%"
+
+
+def test_clearing_group_variance_looser():
+    """Dedicated variance cap of 5% should accept a 3% clearing group even if normal cap is 2%."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        clearing_group_variance_pct=5.0,
+        variance_normal_ceiling_pct=2.0,
+    )
+    books = _clr_books()  # sums to 97,000 → 3% var vs 100,000
+    as26 = [_as26(0, 100000.0)]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    matched, suggested = _split_results(all_results)
+    clr_matches = [r for r in matched if r.match_type.startswith("CLR_GROUP")]
+    assert len(clr_matches) == 1, "CLR_GROUP should match at 3% when cap is 5%"
+
+
+def test_clearing_group_variance_none_inherits():
+    """When clearing_group_variance_pct=None, should inherit variance_normal_ceiling_pct."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        clearing_group_variance_pct=None,
+        variance_normal_ceiling_pct=3.0,
+    )
+    books = _clr_books()  # 3% var
+    as26 = [_as26(0, 100000.0)]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    matched, suggested = _split_results(all_results)
+    clr_matches = [r for r in matched if r.match_type.startswith("CLR_GROUP")]
+    assert len(clr_matches) == 1, "CLR_GROUP should match when inheriting 3% normal ceiling"
+
+
+def test_proxy_clearing_disabled():
+    """When proxy_clearing_enabled=False, no PROXY_GROUP matches should appear."""
+    from config import MatchConfig
+    cfg = MatchConfig(proxy_clearing_enabled=False)
+    # Books with NO clearing doc (forces proxy path) but same doc_date
+    books = [
+        _book(0, 40000.0, "INV-X", clearing_doc="", doc_date="15-Jun-2023"),
+        _book(1, 35000.0, "INV-Y", clearing_doc="", doc_date="15-Jun-2023"),
+        _book(2, 22000.0, "INV-Z", clearing_doc="", doc_date="15-Jun-2023"),
+    ]
+    as26 = [_as26(0, 100000.0)]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    for r in all_results:
+        assert not r.match_type.startswith("PROXY_GROUP"), f"Unexpected proxy match: {r.match_type}"

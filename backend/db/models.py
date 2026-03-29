@@ -386,7 +386,7 @@ class AdminSettings(Base):
     exclude_sgl_v: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Combo Settings
-    max_combo_size: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
+    max_combo_size: Mapped[int] = mapped_column(Integer, default=5)  # Default to MAX_COMBO_SIZE from config.py
     date_clustering_preference: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Cross-FY
@@ -398,6 +398,11 @@ class AdminSettings(Base):
 
     # Noise
     noise_threshold: Mapped[float] = mapped_column(Float, default=1.0)
+
+    # Clearing Group (Phase A)
+    clearing_group_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, default=None)
+    clearing_group_variance_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
+    proxy_clearing_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, default=None)
 
     # Metadata
     updated_by_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)

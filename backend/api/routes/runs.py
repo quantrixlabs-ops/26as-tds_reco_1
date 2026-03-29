@@ -249,21 +249,43 @@ async def download_batch_excel(
     # Load data for each completed run
     runs_data = []
     for run in completed_runs:
-        matched_result = await db.execute(select(MatchedPair).where(MatchedPair.run_id == run.id))
-        unmatched_result = await db.execute(select(Unmatched26AS).where(Unmatched26AS.run_id == run.id))
-        books_result = await db.execute(select(UnmatchedBook).where(UnmatchedBook.run_id == run.id))
-        exc_result = await db.execute(select(ExceptionRecord).where(ExceptionRecord.run_id == run.id))
+        matched_result = await db.execute(
+            select(MatchedPair).where(MatchedPair.run_id == run.id).order_by(MatchedPair.as26_index)
+        )
+        unmatched_result = await db.execute(
+            select(Unmatched26AS).where(Unmatched26AS.run_id == run.id).order_by(Unmatched26AS.amount.desc())
+        )
+        books_result = await db.execute(
+            select(UnmatchedBook).where(UnmatchedBook.run_id == run.id).order_by(UnmatchedBook.amount.desc())
+        )
+        exc_result = await db.execute(
+            select(ExceptionRecord).where(ExceptionRecord.run_id == run.id).order_by(ExceptionRecord.severity)
+        )
+        suggested_result = await db.execute(
+            select(SuggestedMatch).where(SuggestedMatch.run_id == run.id)
+        )
 
-        runs_data.append({
+        rd = {
             "run": run,
             "matched_pairs": list(matched_result.scalars().all()),
             "unmatched_26as": list(unmatched_result.scalars().all()),
             "unmatched_books": list(books_result.scalars().all()),
             "exceptions": list(exc_result.scalars().all()),
-        })
+            "suggested_matches": list(suggested_result.scalars().all()),
+        }
+        runs_data.append(rd)
+
+    # Load admin-configured variance thresholds for Excel color coding
+    from db.models import AdminSettings
+    adm_result = await db.execute(
+        select(AdminSettings).where(AdminSettings.is_active == True)
+    )
+    adm = adm_result.scalar_one_or_none()
+    var_ceiling = adm.variance_normal_ceiling_pct if adm and adm.variance_normal_ceiling_pct is not None else 3.0
+    var_thresholds = (1.0, var_ceiling)
 
     from services.excel_v2 import generate_batch_excel
-    excel_bytes = generate_batch_excel(runs_data)
+    excel_bytes = generate_batch_excel(runs_data, variance_thresholds=var_thresholds)
 
     from core.security import sha256_file
     output_hash = sha256_file(excel_bytes)
@@ -1109,6 +1131,49 @@ async def cancel_run(
 
 # ── Delete ────────────────────────────────────────────────────────────────
 
+@router.delete("/batch/{batch_id}", status_code=200)
+async def delete_batch(
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete an entire batch and all its runs with associated data.
+    Audit logs are PRESERVED for regulatory compliance — only result data is deleted.
+    """
+    result = await db.execute(
+        select(ReconciliationRun).where(ReconciliationRun.batch_id == batch_id)
+    )
+    runs = list(result.scalars().all())
+    if not runs:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+    processing = [r for r in runs if r.status == "PROCESSING"]
+    if processing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete batch — {len(processing)} run(s) still processing. Wait for them to finish or cancel first.",
+        )
+
+    run_numbers = [r.run_number for r in runs]
+    await log_event(db, "BATCH_DELETED",
+                    f"Batch {batch_id} ({len(runs)} runs) deleted by {current_user.full_name}",
+                    run_id=runs[0].id, user_id=current_user.id,
+                    metadata={"batch_id": batch_id, "run_count": len(runs),
+                              "run_numbers": run_numbers})
+
+    for run in runs:
+        for model in [MatchedPair, SuggestedMatch, Unmatched26AS, UnmatchedBook, ExceptionRecord]:
+            await db.execute(
+                model.__table__.delete().where(model.run_id == run.id)
+            )
+        await db.delete(run)
+
+    await db.flush()
+
+    return {"status": "DELETED", "batch_id": batch_id, "deleted_runs": len(runs),
+            "run_numbers": run_numbers}
+
+
 @router.delete("/{run_id}", status_code=200)
 async def delete_run(
     run_id: str,
@@ -1156,19 +1221,42 @@ async def download_excel(
         raise HTTPException(status_code=400, detail=f"Run not yet complete (status: {run.status})")
 
     # Load all data
-    matched_result = await db.execute(select(MatchedPair).where(MatchedPair.run_id == run_id))
-    unmatched_result = await db.execute(select(Unmatched26AS).where(Unmatched26AS.run_id == run_id))
-    books_result = await db.execute(select(UnmatchedBook).where(UnmatchedBook.run_id == run_id))
-    exc_result = await db.execute(select(ExceptionRecord).where(ExceptionRecord.run_id == run_id))
+    matched_result = await db.execute(
+        select(MatchedPair).where(MatchedPair.run_id == run_id).order_by(MatchedPair.as26_index)
+    )
+    unmatched_result = await db.execute(
+        select(Unmatched26AS).where(Unmatched26AS.run_id == run_id).order_by(Unmatched26AS.amount.desc())
+    )
+    books_result = await db.execute(
+        select(UnmatchedBook).where(UnmatchedBook.run_id == run_id).order_by(UnmatchedBook.amount.desc())
+    )
+    exc_result = await db.execute(
+        select(ExceptionRecord).where(ExceptionRecord.run_id == run_id).order_by(ExceptionRecord.severity)
+    )
+    suggested_result = await db.execute(
+        select(SuggestedMatch).where(SuggestedMatch.run_id == run_id)
+    )
 
     matched_pairs = matched_result.scalars().all()
     unmatched_26as = unmatched_result.scalars().all()
     unmatched_books = books_result.scalars().all()
     exceptions = exc_result.scalars().all()
+    suggested_matches = list(suggested_result.scalars().all())
+
+    # Load admin-configured variance thresholds for Excel color coding
+    from db.models import AdminSettings
+    adm_result = await db.execute(
+        select(AdminSettings).where(AdminSettings.is_active == True)
+    )
+    adm = adm_result.scalar_one_or_none()
+    var_ceiling = adm.variance_normal_ceiling_pct if adm and adm.variance_normal_ceiling_pct is not None else 3.0
+    var_thresholds = (1.0, var_ceiling)
 
     # Generate Excel using v2 generator
     from services.excel_v2 import generate_excel_v2
-    excel_bytes = generate_excel_v2(run, matched_pairs, unmatched_26as, unmatched_books, exceptions)
+    excel_bytes = generate_excel_v2(run, matched_pairs, unmatched_26as, unmatched_books, exceptions,
+                                    suggested_matches=suggested_matches,
+                                    variance_thresholds=var_thresholds)
 
     # Compute output hash
     from core.security import sha256_file

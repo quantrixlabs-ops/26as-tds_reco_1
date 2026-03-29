@@ -212,14 +212,20 @@ def run_global_optimizer(
     active_books = current_books if not effective_allow_cross_fy else book_pool
 
     # ── Phase A: Clearing Group Matching ─────────────────────────────────────
-    logger.info("optimizer.phase_a_start")
-    _progress("PHASE_A", 0, len(as26_entries), 0, "Building clearing groups...")
-    phase_a_matched, phase_a_unmatched = _phase_a_clearing_groups(
-        as26_entries, active_books, used_book_indices, consumed_invoice_refs, cfg
-    )
-    all_results.extend(phase_a_matched)
-    _progress("PHASE_A", len(as26_entries), len(as26_entries), len(all_results),
-              f"Clearing groups done: {len(phase_a_matched)} matched")
+    if cfg.clearing_group_enabled:
+        logger.info("optimizer.phase_a_start")
+        _progress("PHASE_A", 0, len(as26_entries), 0, "Building clearing groups...")
+        phase_a_matched, phase_a_unmatched = _phase_a_clearing_groups(
+            as26_entries, active_books, used_book_indices, consumed_invoice_refs, cfg
+        )
+        all_results.extend(phase_a_matched)
+        _progress("PHASE_A", len(as26_entries), len(as26_entries), len(all_results),
+                  f"Clearing groups done: {len(phase_a_matched)} matched")
+    else:
+        logger.info("optimizer.phase_a_skipped (clearing_group_enabled=False)")
+        _progress("PHASE_A", len(as26_entries), len(as26_entries), 0, "Phase A skipped")
+        phase_a_matched = []
+        phase_a_unmatched = as26_entries
 
     # ── Phase B: Bipartite single + smart combo ──────────────────────────────
     logger.info("optimizer.phase_b_start")
@@ -382,7 +388,7 @@ def _phase_a_clearing_groups(
 
     # Pre-compute group sums and check availability once
     excluded = used_book_indices | consumed_invoice_refs
-    clr_cap = cfg.variance_normal_ceiling_pct
+    clr_cap = cfg.clearing_group_variance_pct if cfg.clearing_group_variance_pct is not None else cfg.variance_normal_ceiling_pct
 
     matched: List[AssignmentResult] = []
     unmatched_26as: List[As26Entry] = []
@@ -454,7 +460,7 @@ def _phase_a_clearing_groups(
     # ── Proxy clearing groups (fallback when clearing_doc is sparse) ────────
     # If Phase A matched very few entries, try date+amount clustering as proxy groups
     clr_coverage = len(matched) / len(as26_entries) if as26_entries else 1.0
-    if clr_coverage < 0.1 and len(unmatched_26as) >= 2:
+    if clr_coverage < 0.1 and len(unmatched_26as) >= 2 and cfg.proxy_clearing_enabled:
         proxy_matched, proxy_unmatched = _proxy_clearing_groups(
             unmatched_26as, book_pool, used_book_indices, consumed_invoice_refs, cfg
         )
@@ -478,7 +484,7 @@ def _proxy_clearing_groups(
 
     excluded = used_book_indices | consumed_invoice_refs
     max_grp = cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE
-    clr_cap = cfg.variance_normal_ceiling_pct
+    clr_cap = cfg.clearing_group_variance_pct if cfg.clearing_group_variance_pct is not None else cfg.variance_normal_ceiling_pct
 
     # Cluster available books by doc_date
     date_groups: Dict[str, List[BookEntry]] = defaultdict(list)

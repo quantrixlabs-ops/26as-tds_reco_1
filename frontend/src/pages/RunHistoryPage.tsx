@@ -2,7 +2,7 @@
  * RunHistoryPage — filterable/searchable list of all reconciliation runs.
  * Batch runs are grouped by batch_id with expandable per-party breakdown.
  */
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -18,6 +18,7 @@ import {
   AlertTriangle,
   Loader2,
   Download,
+  Trash2,
 } from 'lucide-react';
 import { runsApi, type RunSummary, type RunStatus } from '../lib/api';
 import { Card } from '../components/ui/Card';
@@ -135,6 +136,8 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
   const [authRemarks, setAuthRemarks] = useState('');
   const [rerunning, setRerunning] = useState(false);
   const [showRerunConfirm, setShowRerunConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const hasCompletedRuns = group.completed > 0;
   const allDone = group.processing === 0;
@@ -334,6 +337,46 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                   )}
                   Download Combined Excel
                 </button>
+                {/* Delete Batch */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowDeleteConfirm(true);
+                  }}
+                  disabled={deleting}
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-semibold rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50"
+                >
+                  {deleting ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  Delete Batch
+                </button>
+                <ConfirmDialog
+                  open={showDeleteConfirm}
+                  onClose={() => setShowDeleteConfirm(false)}
+                  onConfirm={async () => {
+                    setShowDeleteConfirm(false);
+                    setDeleting(true);
+                    try {
+                      const res = await runsApi.batchDelete(group.batch_id);
+                      onRefresh();
+                      toast('Batch deleted', `${res.deleted_runs} runs permanently deleted.`, 'success');
+                    } catch (err: any) {
+                      const msg = err?.response?.data?.detail || 'Delete failed';
+                      toast('Delete failed', msg, 'error');
+                    } finally {
+                      setDeleting(false);
+                    }
+                  }}
+                  title={`Delete entire batch (${group.total_parties} parties)?`}
+                  description="All matched pairs, suggested matches, exceptions, and uploaded files for every run in this batch will be permanently deleted. Audit logs are preserved. This action cannot be undone."
+                  confirmLabel="Delete batch"
+                  variant="danger"
+                  loading={deleting}
+                  icon={<Trash2 className="h-5 w-5 text-red-600" />}
+                />
               </div>
             )}
             {/* Feedback message after authorize */}
@@ -535,11 +578,27 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
   const [fyFilter, setFyFilter] = useState('');
   const [modeFilter, setModeFilter] = useState<ModeFilter>(defaultMode);
 
-  const { data: runs = [], isLoading, refetch, isFetching } = useQuery({
+  const { data: runs = [], isLoading, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['runs'],
     queryFn: runsApi.list,
     refetchInterval: 30_000,
   });
+
+  // "Last refreshed" relative time
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const lastRefreshed = dataUpdatedAt
+    ? (() => {
+        const secs = Math.floor((Date.now() - dataUpdatedAt) / 1000);
+        if (secs < 10) return 'just now';
+        if (secs < 60) return `${secs}s ago`;
+        const mins = Math.floor(secs / 60);
+        return `${mins}m ago`;
+      })()
+    : null;
 
   // Apply filters
   const filtered = useMemo(() => {
@@ -691,13 +750,18 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => refetch()}
-            disabled={isFetching}
-            className="p-2 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 disabled:opacity-50"
-          >
-            <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} />
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => refetch()}
+              disabled={isFetching}
+              className="p-2 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 disabled:opacity-50"
+            >
+              <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} />
+            </button>
+            {lastRefreshed && (
+              <span className="text-[10px] text-gray-400 whitespace-nowrap">{lastRefreshed}</span>
+            )}
+          </div>
           <button
             onClick={() => navigate('/runs/new')}
             className="flex items-center gap-2 px-4 py-2 bg-[#1B3A5C] text-white text-sm font-semibold rounded-lg hover:bg-[#15304d] transition-colors"

@@ -17,8 +17,8 @@ class Settings(BaseSettings):
 
     # ── App ──────────────────────────────────────────────────────────────────
     APP_NAME: str = "26AS Matcher"
-    APP_VERSION: str = "2.0.0"
-    ALGORITHM_VERSION: str = "v5.3"
+    APP_VERSION: str = "2.5.0"
+    ALGORITHM_VERSION: str = "v5.4"
     DEBUG: bool = False
     ENVIRONMENT: str = "development"   # development | staging | production
 

@@ -150,6 +150,11 @@ class MatchConfig:
     # Noise
     noise_threshold: float = 1.0
 
+    # Clearing Group (Phase A)
+    clearing_group_enabled: bool = True
+    clearing_group_variance_pct: float | None = None  # None = inherit variance_normal_ceiling_pct
+    proxy_clearing_enabled: bool = True
+
     # Internals (not user-configurable)
     exact_tolerance: float = 0.01
     combo_pool_cap: int = 5000

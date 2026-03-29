@@ -347,6 +347,9 @@ export interface AdminSettings {
   cross_fy_lookback_years: number;
   force_match_enabled: boolean;
   noise_threshold: number;
+  clearing_group_enabled: boolean;
+  clearing_group_variance_pct: number | null;
+  proxy_clearing_enabled: boolean;
   updated_at: string | null;
 }
 
@@ -681,6 +684,11 @@ export const runsApi = {
 
   delete: (id: string) =>
     apiClient.delete<{ status: string; run_id: string; run_number: number }>(`/api/runs/${id}`).then((r) => r.data),
+
+  batchDelete: (batchId: string) =>
+    apiClient.delete<{ status: string; batch_id: string; deleted_runs: number; run_numbers: number[] }>(
+      `/api/runs/batch/${batchId}`,
+    ).then((r) => r.data),
 
   suggested: (id: string) =>
     apiClient.get<SuggestedMatch[]>(`/api/runs/${id}/suggested`).then((r) => r.data),

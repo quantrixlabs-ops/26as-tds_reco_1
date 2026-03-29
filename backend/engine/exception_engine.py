@@ -60,9 +60,9 @@ def generate_exceptions(
 
         # 2. HIGH_VARIANCE (>3% but not FORCE)
         elif result.variance_pct > 3.0 and "FORCE" not in result.match_type:
-            # Auto-confirmed high-variance matches get INFO severity (audit trail only)
-            # Non-suggested high-variance = auto-confirmed by optimizer
-            sev = "INFO" if not result.suggested else "MEDIUM"
+            # Auto-confirmed high-variance matches get LOW severity (blocks auto-approval)
+            # Suggested high-variance matches get MEDIUM severity
+            sev = "LOW" if not result.suggested else "MEDIUM"
             exceptions.append(_exc(
                 run_id=run_id,
                 exception_type="HIGH_VARIANCE",

@@ -63,6 +63,7 @@ class RunSummary(BaseModel):
     error_message: Optional[str] = None
     # Amount totals
     total_26as_amount: float = 0.0
+    total_sap_amount: float = 0.0
     matched_amount: float = 0.0
     unmatched_26as_amount: float = 0.0
 
@@ -337,7 +338,9 @@ async def rerun_batch(
                 financial_year=orig.financial_year,
                 batch_id=new_batch_id,
                 deductor_filter_parties=orig.deductor_filter_parties,
-                run_config=orig.run_config,
+                # Pass run_config=None so rerun picks up CURRENT admin settings,
+                # not the stale snapshot from the original run
+                run_config=None,
             )
         )
         _background_tasks.add(task)
@@ -445,22 +448,32 @@ async def batch_authorize_all_suggested(
 
     # Pre-load existing MatchedPair hashes per run to prevent duplicate promotion
     existing_mp_hashes: Dict[str, set] = {}
+    # Pre-load consumed invoice refs per run to enforce invoice uniqueness (Section 199 compliance)
+    consumed_invoice_refs: Dict[str, set] = {}
     for rid in run_ids:
         mp_result = await db.execute(
-            select(MatchedPair.as26_row_hash).where(MatchedPair.run_id == rid)
+            select(MatchedPair.as26_row_hash, MatchedPair.invoice_refs).where(MatchedPair.run_id == rid)
         )
-        existing_mp_hashes[rid] = {row[0] for row in mp_result.all() if row[0]}
+        hashes = set()
+        refs = set()
+        for row in mp_result.all():
+            if row[0]:
+                hashes.add(row[0])
+            if row[1]:
+                try:
+                    for ref in (_json.loads(row[1]) if isinstance(row[1], str) else row[1]):
+                        if ref:
+                            refs.add(ref)
+                except (TypeError, _json.JSONDecodeError):
+                    pass
+        existing_mp_hashes[rid] = hashes
+        consumed_invoice_refs[rid] = refs
 
     # Track hashes promoted in THIS batch to avoid duplicates within the same authorize call
     promoted_hashes: Dict[str, set] = {rid: set() for rid in run_ids}
+    skipped_invoice_reuse = 0
 
     for sm in pending:
-        sm.authorized = True
-        sm.authorized_by_id = current_user.id
-        sm.authorized_at = now
-        sm.remarks = remarks or "Batch-level authorize all"
-        success_count += 1
-
         hash_key = sm.as26_row_hash or ""
 
         # Skip MatchedPair creation if one already exists for this (run_id, as26_row_hash)
@@ -469,7 +482,33 @@ async def batch_authorize_all_suggested(
             hash_key in promoted_hashes.get(sm.run_id, set())
         ):
             skipped_dup += 1
+            sm.authorized = True
+            sm.authorized_by_id = current_user.id
+            sm.authorized_at = now
+            sm.remarks = remarks or "Batch-level authorize all (hash duplicate — promotion skipped)"
+            success_count += 1
             continue
+
+        # Invoice uniqueness check: skip if any invoice_ref is already consumed
+        sm_refs = set()
+        if sm.invoice_refs:
+            try:
+                parsed = _json.loads(sm.invoice_refs) if isinstance(sm.invoice_refs, str) else sm.invoice_refs
+                sm_refs = {r for r in parsed if r}
+            except (TypeError, _json.JSONDecodeError):
+                pass
+        run_consumed = consumed_invoice_refs.get(sm.run_id, set())
+        overlap = sm_refs & run_consumed
+        if overlap:
+            skipped_invoice_reuse += 1
+            sm.authorized = False  # Do NOT authorize — invoice reuse
+            continue
+
+        sm.authorized = True
+        sm.authorized_by_id = current_user.id
+        sm.authorized_at = now
+        sm.remarks = remarks or "Batch-level authorize all"
+        success_count += 1
 
         # Build audit remark for high-variance matches
         mp_remark = None
@@ -511,9 +550,11 @@ async def batch_authorize_all_suggested(
         )
         db.add(mp)
 
-        # Track this hash as promoted
+        # Track this hash and invoice refs as promoted/consumed
         if hash_key:
             promoted_hashes.setdefault(sm.run_id, set()).add(hash_key)
+        if sm_refs:
+            consumed_invoice_refs.setdefault(sm.run_id, set()).update(sm_refs)
 
         # Soft-delete: mark Unmatched26AS as PROMOTED (preserves audit trail)
         if sm.as26_row_hash:
@@ -564,6 +605,40 @@ async def batch_authorize_all_suggested(
         run.medium_confidence_count = conf_map.get("MEDIUM", 0)
         run.low_confidence_count = conf_map.get("LOW", 0)
 
+        # ── Recount suggested_count (pending only — not authorized/rejected) ──
+        suggested_pending_result = await db.execute(
+            select(func.count(SuggestedMatch.id)).where(
+                SuggestedMatch.run_id == rid,
+                SuggestedMatch.authorized == False,
+                SuggestedMatch.rejected == False,
+            )
+        )
+        run.suggested_count = suggested_pending_result.scalar() or 0
+
+        # ── Recompute matched_amount and control_total from live DB amounts ──
+        matched_amt_result = await db.execute(
+            select(func.sum(MatchedPair.as26_amount)).where(MatchedPair.run_id == rid)
+        )
+        live_matched_amt = matched_amt_result.scalar() or 0.0
+        suggested_amt_result = await db.execute(
+            select(func.sum(SuggestedMatch.as26_amount)).where(
+                SuggestedMatch.run_id == rid,
+                SuggestedMatch.authorized == False,
+                SuggestedMatch.rejected == False,
+            )
+        )
+        live_suggested_amt = suggested_amt_result.scalar() or 0.0
+        unmatched_amt_result = await db.execute(
+            select(func.sum(Unmatched26AS.amount)).where(
+                Unmatched26AS.run_id == rid, Unmatched26AS.status == "ACTIVE"
+            )
+        )
+        live_unmatched_amt = unmatched_amt_result.scalar() or 0.0
+        run.matched_amount = round(live_matched_amt, 2)
+        run.unmatched_26as_amount = round(live_unmatched_amt, 2)
+        computed_sum = live_matched_amt + live_suggested_amt + live_unmatched_amt
+        run.control_total_balanced = abs(run.total_26as_amount - computed_sum) < 0.02
+
     await db.flush()
 
     # Count remaining skipped (only when no remarks provided)
@@ -609,6 +684,7 @@ async def batch_authorize_all_suggested(
         "promoted_count": sum(promoted_per_run.values()),
         "skipped_requires_remarks": skipped,
         "skipped_duplicates": skipped_dup,
+        "skipped_invoice_reuse": skipped_invoice_reuse,
         "runs_affected": len(promoted_per_run),
     }
 
@@ -685,6 +761,8 @@ async def rerun_single(
     )
     await db.commit()
 
+    # Pass run_config=None so rerun picks up CURRENT admin settings,
+    # not the stale snapshot from the original run
     task = asyncio.create_task(
         _run_reconciliation_background(
             run_id=run.id,
@@ -696,7 +774,7 @@ async def rerun_single(
             financial_year=original.financial_year,
             batch_id=original.batch_id,
             deductor_filter_parties=original.deductor_filter_parties,
-            run_config=original.run_config,
+            run_config=None,
         )
     )
     _background_tasks.add(task)
@@ -719,7 +797,7 @@ async def rerun_single(
 @router.get("/{run_id}/matched")
 async def get_matched_pairs(
     run_id: str,
-    limit: int = 100,
+    limit: int = 10000,
     offset: int = 0,
     confidence: Optional[str] = None,
     match_type: Optional[str] = None,
@@ -752,7 +830,7 @@ async def get_unmatched_26as(
     entries = result.scalars().all()
     reason_labels = {
         "U01": "No matching invoice found in SAP",
-        "U02": "Amount variance exceeds tolerance",
+        "U02": "Candidate invoice consumed by another match",
         "U04": "Below noise threshold",
     }
     return [
@@ -820,7 +898,7 @@ async def review_run(
     """Reviewer approves or rejects the reconciliation run."""
     run = await _get_run_or_404(run_id, db)
 
-    if run.created_by_id == current_user.id:
+    if run.created_by_id == current_user.id and not settings.ALLOW_SELF_REVIEW:
         raise HTTPException(status_code=403, detail="Cannot review your own run (maker-checker rule)")
 
     if run.status not in ("PENDING_REVIEW", "PROCESSING"):
@@ -864,7 +942,7 @@ async def review_run(
             run.match_rate_pct = round((live_matched / run.total_26as_entries) * 100, 2)
 
         # Block approval if match rate is below minimum threshold
-        MIN_APPROVAL_MATCH_RATE = 75.0
+        from config import MIN_APPROVAL_MATCH_RATE
         if run.match_rate_pct < MIN_APPROVAL_MATCH_RATE:
             raise HTTPException(
                 status_code=400,
@@ -962,6 +1040,13 @@ async def review_run(
                     run_id=run_id, user_id=current_user.id,
                     metadata={"action": body.action, "notes": body.notes,
                               "reverted_promotions": reverted_count})
+    # Explicit REVIEW_ event for audit trail tab filtering
+    await log_event(db, f"REVIEW_{body.action}",
+                    f"Run RUN-{run.run_number:04d} reviewed ({body.action.lower()}) by {current_user.full_name}",
+                    run_id=run_id, user_id=current_user.id,
+                    metadata={"reviewer": current_user.full_name, "reviewer_role": current_user.role,
+                              "action": body.action, "notes": body.notes,
+                              "match_rate_pct": run.match_rate_pct})
 
     return {"status": run.status, "reviewed_by": current_user.full_name}
 
@@ -1583,9 +1668,20 @@ async def authorize_suggested_matches(
 
     # Pre-load existing MatchedPair hashes for this run to prevent duplicate promotion
     existing_mp_result = await db.execute(
-        select(MatchedPair.as26_row_hash).where(MatchedPair.run_id == run_id)
+        select(MatchedPair.as26_row_hash, MatchedPair.invoice_refs).where(MatchedPair.run_id == run_id)
     )
-    existing_mp_hashes = {row[0] for row in existing_mp_result.all() if row[0]}
+    existing_mp_hashes: set = set()
+    consumed_refs: set = set()
+    for row in existing_mp_result.all():
+        if row[0]:
+            existing_mp_hashes.add(row[0])
+        if row[1]:
+            try:
+                for ref in (_json.loads(row[1]) if isinstance(row[1], str) else row[1]):
+                    if ref:
+                        consumed_refs.add(ref)
+            except (TypeError, _json.JSONDecodeError):
+                pass
     promoted_hashes: set = set()
 
     for sm_id in body.ids:
@@ -1636,6 +1732,18 @@ async def authorize_suggested_matches(
         if hash_key and (hash_key in existing_mp_hashes or hash_key in promoted_hashes):
             continue
 
+        # Invoice uniqueness check: skip promotion if any invoice_ref already consumed
+        sm_refs = set()
+        if sm.invoice_refs:
+            try:
+                parsed = _json.loads(sm.invoice_refs) if isinstance(sm.invoice_refs, str) else sm.invoice_refs
+                sm_refs = {r for r in parsed if r}
+            except (TypeError, _json.JSONDecodeError):
+                pass
+        overlap = sm_refs & consumed_refs
+        if overlap:
+            continue  # skip — invoice already used by another matched pair
+
         # Build remark for matches above suggested ceiling
         remark = None
         if sm.variance_pct > suggested_ceiling_pct:
@@ -1679,6 +1787,8 @@ async def authorize_suggested_matches(
 
         if hash_key:
             promoted_hashes.add(hash_key)
+        if sm_refs:
+            consumed_refs.update(sm_refs)
 
         # Soft-delete: mark Unmatched26AS as PROMOTED (preserves audit trail)
         if sm.as26_row_hash:
@@ -1731,6 +1841,31 @@ async def authorize_suggested_matches(
         run.high_confidence_count = conf_map.get("HIGH", 0)
         run.medium_confidence_count = conf_map.get("MEDIUM", 0)
         run.low_confidence_count = conf_map.get("LOW", 0)
+
+        # Recompute control_total_balanced from live amounts
+        matched_amt_result = await db.execute(
+            select(func.sum(MatchedPair.as26_amount)).where(MatchedPair.run_id == run_id)
+        )
+        live_matched_amt = matched_amt_result.scalar() or 0.0
+        suggested_amt_result = await db.execute(
+            select(func.sum(SuggestedMatch.as26_amount)).where(
+                SuggestedMatch.run_id == run_id,
+                SuggestedMatch.authorized == False,
+                SuggestedMatch.rejected == False,
+            )
+        )
+        live_suggested_amt = suggested_amt_result.scalar() or 0.0
+        unmatched_amt_result = await db.execute(
+            select(func.sum(Unmatched26AS.amount)).where(
+                Unmatched26AS.run_id == run_id, Unmatched26AS.status == "ACTIVE"
+            )
+        )
+        live_unmatched_amt = unmatched_amt_result.scalar() or 0.0
+        run.matched_amount = round(live_matched_amt, 2)
+        run.unmatched_26as_amount = round(live_unmatched_amt, 2)
+        computed_sum = live_matched_amt + live_suggested_amt + live_unmatched_amt
+        run.control_total_balanced = abs(run.total_26as_amount - computed_sum) < 0.02
+
         await db.flush()
 
     # Build detailed audit metadata with before/after context per match
@@ -2043,6 +2178,7 @@ def _run_to_summary(r: ReconciliationRun) -> RunSummary:
         batch_id=r.batch_id,
         error_message=r.error_message,
         total_26as_amount=r.total_26as_amount or 0.0,
+        total_sap_amount=r.total_sap_amount or 0.0,
         matched_amount=r.matched_amount or 0.0,
         unmatched_26as_amount=r.unmatched_26as_amount or 0.0,
     )
@@ -2151,7 +2287,7 @@ async def get_compliance_report(
     type_dist: dict = {}
     total_variance_amt = 0.0
     max_variance_pct = 0.0
-    section_199_violations = 0
+    overclaim_violations = 0
     invoice_refs_seen: set = set()
     invoice_reuse_count = 0
 
@@ -2163,9 +2299,9 @@ async def get_compliance_report(
         total_variance_amt += abs(mp.variance_amt)
         max_variance_pct = max(max_variance_pct, mp.variance_pct)
 
-        # Section 199 check: books_sum must not exceed as26_amount
+        # Over-claim check: books_sum must not exceed as26_amount
         if mp.books_sum > mp.as26_amount + 0.01:
-            section_199_violations += 1
+            overclaim_violations += 1
 
         # Invoice reuse check
         if mp.invoice_refs:
@@ -2225,11 +2361,11 @@ async def get_compliance_report(
         "config_snapshot": run.config_snapshot,
         "admin_settings_id": run.admin_settings_id,
         "compliance": {
-            "section_199_violations": section_199_violations,
+            "overclaim_violations": overclaim_violations,
             "invoice_reuse_violations": invoice_reuse_count,
             "max_variance_pct": round(max_variance_pct, 4),
             "total_variance_amount": round(total_variance_amt, 2),
-            "books_exceed_26as": section_199_violations == 0,
+            "books_exceed_26as": overclaim_violations == 0,
             "no_invoice_reuse": invoice_reuse_count == 0,
             "constraint_violations": run.constraint_violations,
         },

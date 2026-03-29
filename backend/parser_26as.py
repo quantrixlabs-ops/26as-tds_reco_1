@@ -208,7 +208,7 @@ def parse_26as(
             amount = float(raw_amt)
         except (ValueError, TypeError):
             continue
-        if amount <= 0:
+        if amount == 0:
             continue
 
         # ── FY date-range filter ──────────────────────────────────────────

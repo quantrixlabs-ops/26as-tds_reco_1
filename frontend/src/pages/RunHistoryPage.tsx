@@ -23,8 +23,11 @@ import { runsApi, type RunSummary, type RunStatus } from '../lib/api';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
-import { FullPageSpinner } from '../components/ui/Spinner';
 import { useToast } from '../components/ui/Toast';
+import { PageWrapper } from '../components/ui/PageHeader';
+import { TableSkeleton } from '../components/ui/Skeleton';
+import { NoRunsEmpty, NoSearchResultsEmpty } from '../components/ui/EmptyState';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import {
   formatDateTime,
   formatPct,
@@ -134,6 +137,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authRemarks, setAuthRemarks] = useState('');
   const [rerunning, setRerunning] = useState(false);
+  const [showRerunConfirm, setShowRerunConfirm] = useState(false);
 
   const hasCompletedRuns = group.completed > 0;
   const allDone = group.processing === 0;
@@ -245,24 +249,9 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
               <div className="col-span-2 sm:col-span-4 flex items-center justify-end gap-3">
                 {/* Rerun Batch */}
                 <button
-                  onClick={async (e) => {
+                  onClick={(e) => {
                     e.stopPropagation();
-                    const hasApproved = group.runs.some((r: any) => r.status === 'APPROVED');
-                    const msg = hasApproved
-                      ? 'This batch contains APPROVED runs. Rerunning will create a new batch with fresh (unapproved) reconciliation results. The original approved runs will NOT be affected.\n\nProceed?'
-                      : 'Rerun this entire batch with fresh reconciliation? A new batch will be created.';
-                    if (!confirm(msg)) return;
-                    setRerunning(true);
-                    try {
-                      const res = await runsApi.batchRerun(group.batch_id);
-                      onRefresh();
-                      alert(`Batch rerun started: ${res.total} runs processing. New batch created.`);
-                    } catch (err: any) {
-                      const msg = err?.response?.data?.detail || 'Rerun failed';
-                      alert(msg);
-                    } finally {
-                      setRerunning(false);
-                    }
+                    setShowRerunConfirm(true);
                   }}
                   disabled={rerunning}
                   className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-semibold rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
@@ -274,6 +263,34 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                   )}
                   Rerun Batch
                 </button>
+                <ConfirmDialog
+                  open={showRerunConfirm}
+                  onClose={() => setShowRerunConfirm(false)}
+                  onConfirm={async () => {
+                    setShowRerunConfirm(false);
+                    setRerunning(true);
+                    try {
+                      const res = await runsApi.batchRerun(group.batch_id);
+                      onRefresh();
+                      toast('Batch rerun started', `${res.total} runs processing. New batch created.`, 'success');
+                    } catch (err: any) {
+                      const msg = err?.response?.data?.detail || 'Rerun failed';
+                      toast('Rerun failed', msg, 'error');
+                    } finally {
+                      setRerunning(false);
+                    }
+                  }}
+                  title={`Rerun batch (${group.total_parties} parties)?`}
+                  description={
+                    group.runs.some((r) => r.status === 'APPROVED')
+                      ? 'This batch contains APPROVED runs. Rerunning will create a new batch with fresh (unapproved) results. The original approved runs will NOT be affected.'
+                      : 'A new batch will be created with fresh reconciliation results. The original batch will not be modified.'
+                  }
+                  confirmLabel="Rerun batch"
+                  variant="info"
+                  loading={rerunning}
+                  icon={<RefreshCw className="h-5 w-5 text-[#1B3A5C]" />}
+                />
                 {/* Authorize All Suggested */}
                 <button
                   onClick={(e) => {
@@ -403,6 +420,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                   <th className="px-4 py-2.5 text-center">Violations</th>
                   <th className="px-4 py-2.5 text-center">Confidence</th>
                   <th className="px-4 py-2.5 text-center">Status</th>
+                  <th className="px-4 py-2.5 text-center">Excel</th>
                 </tr>
               </thead>
               <tbody>
@@ -468,6 +486,25 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                         {statusIcon(r.status)}
                         <span className="text-xs">{runStatusLabel(r.status)}</span>
                       </div>
+                    </td>
+                    <td className="px-4 py-2.5 text-center">
+                      {r.status !== 'PROCESSING' && r.status !== 'FAILED' && (
+                        <button
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            try {
+                              await runsApi.download(r.id);
+                              toast('Excel downloaded', `${r.deductor_name || 'Run'} exported`, 'success');
+                            } catch (err: any) {
+                              toast('Download failed', err?.response?.data?.detail || err?.message || 'Download failed', 'error');
+                            }
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-[#1B3A5C] hover:bg-[#1B3A5C]/5 rounded transition-colors"
+                          title={`Download Excel for ${r.deductor_name || 'this run'}`}
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -619,12 +656,27 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
     },
   ];
 
-  if (isLoading) return <FullPageSpinner message="Loading runs…" />;
+  if (isLoading) {
+    return (
+      <PageWrapper>
+        <div className="flex items-start justify-between">
+          <div className="space-y-2">
+            <div className="h-6 w-48 bg-gray-200/70 rounded-md animate-pulse" />
+            <div className="h-4 w-64 bg-gray-200/70 rounded-md animate-pulse" />
+          </div>
+          <div className="h-10 w-28 bg-gray-200/70 rounded-lg animate-pulse" />
+        </div>
+        <Card padding={false}>
+          <TableSkeleton columns={7} rows={6} />
+        </Card>
+      </PageWrapper>
+    );
+  }
 
   const hasActiveFilters = !!(search || statusFilter || fyFilter || modeFilter);
 
   return (
-    <div className="space-y-6">
+    <PageWrapper>
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
@@ -784,14 +836,20 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
       {/* Empty state when only batch filter active and no batches */}
       {modeFilter === 'BATCH' && batchGroups.length === 0 && (
         <Card>
-          <div className="text-center py-12">
-            <Layers className="h-8 w-8 text-gray-300 mx-auto mb-3" />
-            <p className="text-sm text-gray-500">
-              {hasActiveFilters ? 'No batch runs match your filters' : 'No batch runs yet'}
-            </p>
-          </div>
+          {hasActiveFilters ? (
+            <NoSearchResultsEmpty query={search || 'batch'} />
+          ) : (
+            <NoRunsEmpty onNewRun={() => navigate('/runs/new')} />
+          )}
         </Card>
       )}
-    </div>
+
+      {/* Empty state when no runs at all */}
+      {runs.length === 0 && !hasActiveFilters && (
+        <Card>
+          <NoRunsEmpty onNewRun={() => navigate('/runs/new')} />
+        </Card>
+      )}
+    </PageWrapper>
   );
 }

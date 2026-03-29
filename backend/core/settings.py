@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # ── App ──────────────────────────────────────────────────────────────────
     APP_NAME: str = "26AS Matcher"
     APP_VERSION: str = "2.0.0"
-    ALGORITHM_VERSION: str = "v5.1"
+    ALGORITHM_VERSION: str = "v5.3"
     DEBUG: bool = False
     ENVIRONMENT: str = "development"   # development | staging | production
 
@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     MAX_LOGIN_ATTEMPTS: int = 5
     LOCKOUT_DURATION_MINUTES: int = 15
     ALLOW_SELF_REGISTRATION: bool = True
+
+    # ── Workflow ─────────────────────────────────────────────────────────
+    ALLOW_SELF_REVIEW: bool = False   # Maker-checker: run creator cannot approve their own run
 
 
 @lru_cache

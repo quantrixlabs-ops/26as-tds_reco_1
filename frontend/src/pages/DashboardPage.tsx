@@ -20,13 +20,18 @@ import {
   YAxis,
   Tooltip,
   ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
 } from 'recharts';
 import { runsApi, type RunSummary } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { StatCard, Card, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
-import { FullPageSpinner } from '../components/ui/Spinner';
+import { DashboardSkeleton } from '../components/ui/Skeleton';
+import { NoRunsEmpty } from '../components/ui/EmptyState';
+import { PageWrapper } from '../components/ui/PageHeader';
 import {
   formatDateTime,
   formatPct,
@@ -60,6 +65,22 @@ export default function DashboardPage() {
         ? matchRates.reduce((a, b) => a + b, 0) / matchRates.length
         : null;
     return { total, pending, failed, completed, avgMatch };
+  }, [runs]);
+
+  // Status distribution for donut chart
+  const statusDistribution = useMemo(() => {
+    const approved = runs.filter((r) => r.status === 'APPROVED').length;
+    const pending = runs.filter((r) => r.status === 'PENDING_REVIEW').length;
+    const processing = runs.filter((r) => r.status === 'PROCESSING').length;
+    const failed = runs.filter((r) => r.status === 'FAILED').length;
+    const rejected = runs.filter((r) => r.status === 'REJECTED').length;
+    return [
+      { name: 'Approved', value: approved, color: '#059669' },
+      { name: 'Pending', value: pending, color: '#d97706' },
+      { name: 'Processing', value: processing, color: '#2563eb' },
+      { name: 'Failed', value: failed, color: '#dc2626' },
+      { name: 'Rejected', value: rejected, color: '#9f1239' },
+    ].filter((d) => d.value > 0);
   }, [runs]);
 
   // Recent 8 runs sorted by created_at desc
@@ -152,7 +173,7 @@ export default function DashboardPage() {
     },
   ];
 
-  if (isLoading) return <FullPageSpinner message="Loading dashboard…" />;
+  if (isLoading) return <DashboardSkeleton />;
 
   const greeting = () => {
     const h = new Date().getHours();
@@ -162,7 +183,7 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <PageWrapper>
       {/* Page header */}
       <div className="flex items-start justify-between">
         <div>
@@ -232,13 +253,17 @@ export default function DashboardPage() {
                 View all <ArrowRight className="h-3 w-3" />
               </button>
             </div>
-            <Table
-              columns={columns}
-              data={recentRuns}
-              keyExtractor={(r) => r.id}
-              onRowClick={(r) => navigate(`/runs/${r.id}`)}
-              emptyMessage="No runs yet. Click 'New Run' to get started."
-            />
+            {recentRuns.length === 0 ? (
+              <NoRunsEmpty onNewRun={() => navigate('/runs/new')} />
+            ) : (
+              <Table
+                columns={columns}
+                data={recentRuns}
+                keyExtractor={(r) => r.id}
+                onRowClick={(r) => navigate(`/runs/${r.id}`)}
+                emptyMessage="No runs yet."
+              />
+            )}
           </Card>
         </div>
 
@@ -279,6 +304,47 @@ export default function DashboardPage() {
             )}
           </Card>
 
+          {/* Status distribution donut */}
+          {statusDistribution.length > 0 && (
+            <Card>
+              <CardHeader title="Status Distribution" subtitle="All runs by status" />
+              <div className="flex items-center gap-2">
+                <ResponsiveContainer width={100} height={100}>
+                  <PieChart>
+                    <Pie
+                      data={statusDistribution}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={28}
+                      outerRadius={45}
+                      dataKey="value"
+                      strokeWidth={2}
+                      stroke="#fff"
+                    >
+                      {statusDistribution.map((entry, i) => (
+                        <Cell key={i} fill={entry.color} />
+                      ))}
+                    </Pie>
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="flex-1 space-y-1">
+                  {statusDistribution.map((d) => (
+                    <div key={d.name} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: d.color }}
+                        />
+                        <span className="text-gray-600">{d.name}</span>
+                      </div>
+                      <span className="font-semibold text-gray-900">{d.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </Card>
+          )}
+
           {/* Quick actions */}
           <Card>
             <CardHeader title="Quick Actions" />
@@ -316,7 +382,7 @@ export default function DashboardPage() {
               <div>
                 <p className="text-xs font-semibold text-blue-800">Compliance Note</p>
                 <p className="text-xs text-blue-600 mt-0.5 leading-relaxed">
-                  Section 199 requires books_sum ≤ 26AS amount. Approved runs are
+                  Over-claim rule: books_sum must not exceed 26AS amount. Approved runs are
                   eligible for client deliverables.
                 </p>
               </div>
@@ -324,6 +390,6 @@ export default function DashboardPage() {
           </Card>
         </div>
       </div>
-    </div>
+    </PageWrapper>
   );
 }

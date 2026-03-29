@@ -193,6 +193,7 @@ export interface RunSummary {
   created_by?: string;
   // Amount totals
   total_26as_amount: number;
+  total_sap_amount?: number;
   matched_amount: number;
   unmatched_26as_amount: number;
 }
@@ -359,7 +360,8 @@ export type SuggestedCategory =
   | 'DATE_SOFT_PREFERENCE'
   | 'ADVANCE_PAYMENT'
   | 'FORCE'
-  | 'CROSS_FY';
+  | 'CROSS_FY'
+  | 'TIER_CAP_EXCEEDED';
 
 export interface SuggestedMatch {
   id: string;
@@ -612,15 +614,22 @@ export const runsApi = {
     const disposition = res.headers['content-disposition'] || '';
     const match = disposition.match(/filename="?([^"]+)"?/);
     const filename = match?.[1] || `TDS_Reco_RUN_${id}.xlsx`;
-    // Trigger browser download
-    const url = window.URL.createObjectURL(res.data);
+    // Ensure blob has correct MIME type
+    const blob = new Blob([res.data], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
-    a.remove();
-    window.URL.revokeObjectURL(url);
+    // Delay cleanup so the browser has time to start the download
+    setTimeout(() => {
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    }, 1000);
   },
 
   batchDownload: async (batchId: string) => {
@@ -630,14 +639,20 @@ export const runsApi = {
     const disposition = res.headers['content-disposition'] || '';
     const match = disposition.match(/filename="?([^"]+)"?/);
     const filename = match?.[1] || `TDS_Batch_${batchId}.xlsx`;
-    const url = window.URL.createObjectURL(res.data);
+    const blob = new Blob([res.data], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
-    a.remove();
-    window.URL.revokeObjectURL(url);
+    setTimeout(() => {
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    }, 1000);
   },
 
   batchRerun: (batchId: string) =>

@@ -29,27 +29,78 @@ KNOWN_SECTIONS: Set[str] = {
     "206AA", "206AB",
 }
 
-# Standard TDS rates by section (used for rate validation)
+# Standard TDS rates by section (used for rate validation).
+# Where rates differ by deductee type, the LOWER rate is used (individual/HUF).
+# This minimizes false-positive rate mismatch flags — a higher actual rate will
+# still be caught if it diverges >2% from the expected rate.
+# Rates as per Finance Act 2024 (applicable FY2024-25 onwards).
 STANDARD_RATES: Dict[str, float] = {
-    "194C": 1.0,    # Individual/HUF contractors
-    "194J": 10.0,   # Professional fees
-    "194I": 10.0,   # Rent (land/building/furniture)
-    "194IA": 1.0,   # Immovable property (non-agri)
-    "194IB": 5.0,   # Rent by individual/HUF > 50k/month
-    "194H": 5.0,    # Commission / brokerage
-    "194D": 5.0,    # Insurance commission
-    "194A": 10.0,   # Interest other than securities
-    "194B": 30.0,   # Lottery winnings
-    "193": 10.0,    # Interest on securities
-    "194G": 5.0,    # Commission on lottery tickets
-    "194O": 1.0,    # E-commerce operators
-    "194Q": 0.1,    # Purchase of goods
-    "195": 20.0,    # Non-resident payments (default)
-    "206AA": 20.0,  # PAN not available — higher rate
+    # ── Salary & pension ────────────────────────────────────────────────────
+    "192":   30.0,   # Salary (slab rates; 30% used as proxy for high-bracket detection)
+    "192A":  10.0,   # Premature EPF withdrawal
+    # ── Interest ────────────────────────────────────────────────────────────
+    "193":   10.0,   # Interest on securities
+    "194A":  10.0,   # Interest other than securities
+    # ── Dividends ───────────────────────────────────────────────────────────
+    "194":   10.0,   # Deemed dividend
+    # ── Lottery / games ─────────────────────────────────────────────────────
+    "194B":  30.0,   # Lottery / crossword / card games
+    "194BB": 30.0,   # Horse race winnings
+    # ── Contractor payments ─────────────────────────────────────────────────
+    "194C":  1.0,    # Contractors — individual/HUF (2% for companies; 1% used as lower bound)
+    # ── Insurance ───────────────────────────────────────────────────────────
+    "194D":  5.0,    # Insurance commission (non-company; 10% for company)
+    "194DA": 5.0,    # Life insurance payout (maturity proceeds)
+    # ── Non-resident sportsman / entertainer ─────────────────────────────────
+    "194E":  20.0,   # Payments to non-resident sportsmen / entertainers
+    "194EE": 10.0,   # NSS deposits
+    # ── Mutual fund / UTI ───────────────────────────────────────────────────
+    "194F":  20.0,   # Repurchase of units by mutual fund / UTI
+    # ── Commission ──────────────────────────────────────────────────────────
+    "194G":  5.0,    # Commission on lottery tickets
+    "194H":  5.0,    # Commission / brokerage
+    # ── Rent ────────────────────────────────────────────────────────────────
+    "194I":  10.0,   # Rent — land/building/furniture (10%); plant/machinery (2%)
+    "194IA": 1.0,    # Transfer of immovable property (non-agricultural)
+    "194IB": 5.0,    # Rent by individual/HUF > ₹50K/month
+    "194IC": 10.0,   # JDA — payment under specified agreement
+    # ── Professional / technical fees ───────────────────────────────────────
+    "194J":  10.0,   # Professional/technical fees (2% for call centre; 10% default)
+    # ── Income from units ───────────────────────────────────────────────────
+    "194K":  10.0,   # Income from units of mutual fund / specified company
+    # ── Compensation / enhanced compensation ────────────────────────────────
+    "194LA": 10.0,   # Compensation on acquisition of immovable property
+    "194LB": 5.0,    # Income from infrastructure debt fund (non-resident)
+    "194LBA": 5.0,   # Certain income from business trust (non-resident)
+    "194LC": 5.0,    # Interest income from Indian company (non-resident)
+    "194LD": 5.0,    # Interest on certain bonds (non-resident)
+    # ── Cash withdrawal ─────────────────────────────────────────────────────
+    "194N":  2.0,    # Cash withdrawal exceeding ₹1 crore
+    # ── E-commerce ──────────────────────────────────────────────────────────
+    "194O":  1.0,    # E-commerce operator payments
+    # ── Specified senior citizen ────────────────────────────────────────────
+    "194P":  10.0,   # TDS on senior citizen (bank computation; slab-based proxy)
+    # ── Purchase of goods ───────────────────────────────────────────────────
+    "194Q":  0.1,    # Purchase of goods exceeding ₹50 lakh
+    # ── Benefit or perquisite ───────────────────────────────────────────────
+    "194R":  10.0,   # Benefit / perquisite in business
+    # ── Virtual digital assets ──────────────────────────────────────────────
+    "194S":  1.0,    # Transfer of virtual digital assets (crypto etc.)
+    # ── Non-resident payments ───────────────────────────────────────────────
+    "195":   20.0,   # Non-resident payments (default; varies by DTAA)
+    "196A":  10.0,   # Income from units (non-resident, other than company)
+    "196B":  10.0,   # Income from units to offshore fund
+    "196C":  10.0,   # Income from foreign currency bonds / GDR
+    "196D":  20.0,   # Income of FII from securities
+    # ── PAN-related higher rates ────────────────────────────────────────────
+    "206AA": 20.0,   # PAN not furnished — higher rate
+    "206AB": 20.0,   # Specified person non-filer — higher rate (double normal or 5%, whichever higher)
 }
 
 RATE_TOLERANCE_PCT = 2.0   # Allow 2% tolerance in rate-derived gross vs reported gross
-HIGH_VALUE_THRESHOLD = 1_000_000  # ₹10 lakh — flag unmatched entries above this
+
+# Import from config.py to keep thresholds centralized
+from config import HIGH_VALUE_THRESHOLD
 
 
 # ── Result Types ──────────────────────────────────────────────────────────────
@@ -265,7 +316,10 @@ def validate_sap_books(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[ValidationI
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _row_signature(row) -> str:
-    """Unique signature for duplicate detection."""
+    """Unique signature for duplicate detection.
+    Includes invoice_number when available to prevent false-positive duplicates
+    (two different transactions with same TAN/section/date/amount).
+    """
     tan = str(row.get("tan", "") or "").strip()
     section = str(row.get("section", "") or "").strip()
     date = str(row.get("transaction_date", "") or "").strip()
@@ -273,7 +327,8 @@ def _row_signature(row) -> str:
     amount = str(round(float(raw_amount), 2)) if raw_amount is not None else "0"
     raw_tds = row.get("tds_amount", 0)
     tds = str(round(float(raw_tds), 2)) if raw_tds is not None else "0"
-    return f"{tan}|{section}|{date}|{amount}|{tds}"
+    invoice = str(row.get("invoice_number", "") or "").strip()
+    return f"{tan}|{section}|{date}|{amount}|{tds}|{invoice}"
 
 
 def _add_flag(existing: str, new_flag: str) -> str:
@@ -288,18 +343,20 @@ def compute_control_totals(
     total_26as_amount: float,
     matched_amount: float,
     unmatched_26as_amount: float,
+    suggested_amount: float = 0.0,
 ) -> dict:
     """
-    Verify: total_26as_amount == matched_amount + unmatched_26as_amount
+    Verify: total_26as_amount == matched_amount + suggested_amount + unmatched_26as_amount
     Returns a control totals dict with balanced flag.
     """
-    computed_sum = matched_amount + unmatched_26as_amount
+    computed_sum = matched_amount + suggested_amount + unmatched_26as_amount
     difference = abs(total_26as_amount - computed_sum)
     balanced = difference < 0.02  # ₹0.02 tolerance for floating point
 
     return {
         "total_26as_amount": round(total_26as_amount, 2),
         "matched_amount": round(matched_amount, 2),
+        "suggested_amount": round(suggested_amount, 2),
         "unmatched_26as_amount": round(unmatched_26as_amount, 2),
         "computed_sum": round(computed_sum, 2),
         "difference": round(difference, 2),

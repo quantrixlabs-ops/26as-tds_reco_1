@@ -33,8 +33,9 @@ import { useAuth } from '../lib/auth';
 import { Card, CardHeader } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
-import { FullPageSpinner } from '../components/ui/Spinner';
 import { useToast } from '../components/ui/Toast';
+import { PageWrapper } from '../components/ui/PageHeader';
+import { TableSkeleton } from '../components/ui/Skeleton';
 import { roleVariant, getErrorMessage, cn, formatDateTime } from '../lib/utils';
 
 // ── Toggle switch (inline) ────────────────────────────────────────────────────
@@ -816,10 +817,25 @@ export default function AdminPage() {
     },
   ];
 
-  if (isLoading) return <FullPageSpinner message="Loading users..." />;
+  if (isLoading) {
+    return (
+      <PageWrapper className="max-w-4xl">
+        <div className="flex items-start justify-between">
+          <div className="space-y-2">
+            <div className="h-6 w-40 bg-gray-200/70 rounded-md animate-pulse" />
+            <div className="h-4 w-56 bg-gray-200/70 rounded-md animate-pulse" />
+          </div>
+          <div className="h-10 w-28 bg-gray-200/70 rounded-lg animate-pulse" />
+        </div>
+        <Card padding={false}>
+          <TableSkeleton columns={4} rows={4} />
+        </Card>
+      </PageWrapper>
+    );
+  }
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <PageWrapper className="max-w-4xl">
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
@@ -880,6 +896,6 @@ export default function AdminPage() {
           </div>
         )}
       </div>
-    </div>
+    </PageWrapper>
   );
 }

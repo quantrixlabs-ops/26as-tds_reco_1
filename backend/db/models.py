@@ -127,6 +127,7 @@ class ReconciliationRun(Base):
 
     # Control totals
     total_26as_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    total_sap_amount: Mapped[float] = mapped_column(Float, default=0.0)
     matched_amount: Mapped[float] = mapped_column(Float, default=0.0)
     unmatched_26as_amount: Mapped[float] = mapped_column(Float, default=0.0)
     control_total_balanced: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -297,16 +298,11 @@ class ExceptionRecord(Base):
     unmatched_26as_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     exception_type: Mapped[str] = mapped_column(
-        Enum(
-            "FORCE_MATCH", "HIGH_VARIANCE", "CROSS_FY", "SECTION_MISMATCH",
-            "RATE_MISMATCH", "PAN_ISSUE", "DUPLICATE_26AS", "PRIOR_YEAR",
-            "AI_RISK_FLAG", "UNMATCHED_HIGH_VALUE",
-            name="exception_type"
-        ),
+        String(50),  # FORCE_MATCH / HIGH_VARIANCE / CROSS_FY / etc.
         nullable=False
     )
     severity: Mapped[str] = mapped_column(
-        Enum("CRITICAL", "HIGH", "MEDIUM", "LOW", name="exception_severity"),
+        String(20),  # CRITICAL / HIGH / MEDIUM / LOW / INFO
         nullable=False
     )
     description: Mapped[str] = mapped_column(Text, nullable=False)

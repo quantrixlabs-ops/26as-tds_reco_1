@@ -33,7 +33,8 @@ from db.models import (
 from engine.validator import validate_26as, validate_sap_books, compute_control_totals
 from engine.exception_engine import generate_exceptions
 from engine.optimizer import (
-    run_global_optimizer, BookEntry, As26Entry, AssignmentResult
+    run_global_optimizer, BookEntry, As26Entry, AssignmentResult,
+    _compute_days_gap, _is_date_eligible,
 )
 from config import (
     MatchConfig,
@@ -41,6 +42,7 @@ from config import (
     fy_date_range, sap_date_window, date_to_fy_label,
     MAX_COMBO_SIZE, VARIANCE_CAP_SINGLE, VARIANCE_CAP_COMBO,
     VARIANCE_CAP_FORCE_SINGLE, FORCE_COMBO_MAX_INVOICES,
+    AUTO_APPROVAL_MIN_MATCH_RATE,
 )
 
 # Import existing v1.0 parsers (reused)
@@ -144,10 +146,17 @@ def _config_snapshot(match_cfg: Optional[MatchConfig] = None) -> dict:
 
 def _determine_unmatched_reason(
     entry: As26Entry,
-    book_entries: List[BookEntry],
+    remaining_books: List[BookEntry],
     noise_threshold: float = 1.0,
+    all_books: Optional[List[BookEntry]] = None,
+    consumed_book_indices: Optional[set] = None,
+    match_cfg: Optional[MatchConfig] = None,
 ) -> Tuple[str, str]:
     """Determine a specific reason code for an unmatched 26AS entry.
+
+    Checks both remaining (unconsumed) books AND the full book pool to give
+    accurate diagnostics — e.g. "best candidate was already matched elsewhere"
+    or "date outside eligibility window".
 
     Returns (reason_code, reason_detail).
     """
@@ -157,31 +166,74 @@ def _determine_unmatched_reason(
     if noise_threshold > 0 and entry.amount < noise_threshold:
         return "U04", f"Amount below noise threshold (₹{noise_threshold})"
 
+    # Use full book pool if provided, else fall back to remaining
+    pool_for_search = all_books if all_books else remaining_books
+    consumed = consumed_book_indices or set()
+
     # U01: No candidate invoices found at all
-    if not book_entries:
+    if not pool_for_search:
         return "U01", "No SAP invoice candidates available for matching"
 
-    # Check if any books are even remotely close
-    has_any_candidate = False
-    best_variance_pct = None
-    best_invoice = None
+    # Find best candidate across ALL books (including consumed ones)
+    best = None  # (variance_pct, signed_var, invoice_ref, doc_date, book_index, is_consumed)
 
-    for b in book_entries:
+    for b in pool_for_search:
         if b.amount <= 0:
             continue
         variance_pct = abs(entry.amount - b.amount) / entry.amount * 100
-        if best_variance_pct is None or variance_pct < best_variance_pct:
-            best_variance_pct = variance_pct
-            best_invoice = b.invoice_ref
-            has_any_candidate = True
+        signed_var = (entry.amount - b.amount) / entry.amount * 100  # positive = book < 26AS
+        is_consumed = b.index in consumed
+        if best is None or variance_pct < best[0]:
+            best = (variance_pct, signed_var, b.invoice_ref, b.doc_date, b.index, is_consumed)
 
-    if not has_any_candidate:
+    if best is None:
         return "U01", "No SAP invoice candidates with positive amounts"
 
-    # U02: Candidates found but variance exceeds all thresholds
+    var_pct, signed_var, inv_ref, inv_date, b_idx, was_consumed = best
+    date_str = f", dated {inv_date}" if inv_date else ""
+
+    # Diagnose WHY the best candidate wasn't matched
+
+    # Case 1: Best candidate was consumed by another match
+    if was_consumed:
+        return "U02", (
+            f"Best candidate '{inv_ref}' ({var_pct:.1f}% variance{date_str}) "
+            f"was already matched to another 26AS entry"
+        )
+
+    # Case 2: Over-claim prevention — book amount > 26AS amount
+    if signed_var < 0:
+        return "U01", (
+            f"Best candidate '{inv_ref}' exceeds 26AS amount by {abs(signed_var):.1f}%{date_str} "
+            f"(books cannot exceed 26AS — over-claim prevention rule)"
+        )
+
+    # Case 3: Variance genuinely exceeds threshold — no viable candidate
+    threshold_desc = "5%" if match_cfg and match_cfg.force_match_enabled else "2%"
+    max_threshold = VARIANCE_CAP_FORCE_SINGLE if match_cfg and match_cfg.force_match_enabled else VARIANCE_CAP_SINGLE
+    if var_pct > max_threshold:
+        # High variance = no viable match found (U01), not "consumed by another" (U02)
+        return "U01", (
+            f"Best candidate '{inv_ref}' has {var_pct:.1f}% variance{date_str}, "
+            f"exceeding maximum threshold ({threshold_desc})"
+        )
+
+    # Case 4: Date ineligible but variance is within threshold
+    if match_cfg is not None:
+        days_gap = _compute_days_gap(entry.transaction_date, inv_date)
+        eligible, _ = _is_date_eligible(days_gap, match_cfg)
+        if not eligible:
+            gap_desc = f"{abs(days_gap)} days" if days_gap is not None else "unknown gap"
+            direction = "after" if (days_gap is not None and days_gap < 0) else "before"
+            return "U01", (
+                f"Best candidate '{inv_ref}' ({var_pct:.1f}% variance{date_str}) "
+                f"is {gap_desc} {direction} 26AS date — outside eligibility window"
+            )
+
+    # Case 5: Candidate looks viable but wasn't matched — optimizer assigned it elsewhere
     return "U02", (
-        f"Best candidate '{best_invoice}' has {best_variance_pct:.1f}% variance, "
-        f"exceeding all match thresholds"
+        f"Best candidate '{inv_ref}' ({var_pct:.1f}% variance{date_str}) "
+        f"was assigned to a closer 26AS entry by the global optimizer"
     )
 
 
@@ -336,6 +388,7 @@ async def run_reconciliation(
         prior_books = [b for b in book_entries if b.sap_fy and b.sap_fy != target_fy]
 
         total_26as_amount = float(validated_df[validated_df["_valid"] == True]["amount"].sum())
+        total_sap_amount = float(sum(b.amount for b in book_entries))
 
         progress_store.update(run.id,
                               total_26as=len(as26_entries),
@@ -373,8 +426,9 @@ async def run_reconciliation(
 
         # ── 7. Compute metrics ────────────────────────────────────────────────
         matched_amount = sum(r.as26_amount for r in matched_results)
+        suggested_amount = sum(r.as26_amount for r in suggested_results)
         unmatched_amount = sum(e.amount for e in unmatched_entries)
-        control_totals = compute_control_totals(total_26as_amount, matched_amount, unmatched_amount)
+        control_totals = compute_control_totals(total_26as_amount, matched_amount, unmatched_amount, suggested_amount)
 
         match_rate = (len(matched_results) / len(as26_entries) * 100) if as26_entries else 0.0
         high_conf = sum(1 for r in matched_results if r.confidence == "HIGH")
@@ -497,7 +551,13 @@ async def run_reconciliation(
             if entry.index in seen_unmatched_idx:
                 continue
             seen_unmatched_idx.add(entry.index)
-            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books, noise_threshold=effective_noise)
+            reason_code, reason_detail = _determine_unmatched_reason(
+                entry, remaining_books,
+                noise_threshold=effective_noise,
+                all_books=book_entries,
+                consumed_book_indices=consumed_book_indices,
+                match_cfg=match_cfg,
+            )
             db.add(Unmatched26AS(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_idx(entry.index, entry.amount, entry.section, entry.tan),
@@ -534,11 +594,11 @@ async def run_reconciliation(
         progress_store.update(run.id, status="FINALIZING", detail="Updating run summary...", phase_pct=0)
         run.deductor_name = deductor_name
         run.tan = tan
-        # Auto-approve if: no blocking exceptions (INFO-only is OK) AND match rate >= 50% AND at least 1 match
+        # Auto-approve if: no blocking exceptions (INFO-only is OK) AND match rate >= 75% AND at least 1 match
         blocking_exceptions = [e for e in exc_dicts if e.get("severity") not in ("INFO",)]
         needs_review = (
             bool(blocking_exceptions)
-            or match_rate < 50.0
+            or match_rate < AUTO_APPROVAL_MIN_MATCH_RATE
             or len(matched_results) == 0
         )
         run.status = "PENDING_REVIEW" if needs_review else "APPROVED"
@@ -557,6 +617,7 @@ async def run_reconciliation(
         run.medium_confidence_count = med_conf
         run.low_confidence_count = low_conf
         run.total_26as_amount = total_26as_amount
+        run.total_sap_amount = round(total_sap_amount, 2)
         run.matched_amount = matched_amount
         run.unmatched_26as_amount = unmatched_amount
         run.control_total_balanced = control_totals["balanced"]
@@ -697,6 +758,7 @@ async def run_reconciliation_on_existing_run(
         prior_books = [b for b in book_entries if b.sap_fy and b.sap_fy != target_fy]
 
         total_26as_amount = float(validated_df[validated_df["_valid"] == True]["amount"].sum())
+        total_sap_amount = float(sum(b.amount for b in book_entries))
 
         progress_store.update(run.id, total_26as=len(as26_entries), total_sap=len(book_entries))
 
@@ -723,8 +785,9 @@ async def run_reconciliation_on_existing_run(
         suggested_results = [r for r in all_results if r.suggested]
 
         matched_amount = sum(r.as26_amount for r in matched_results)
+        suggested_amount = sum(r.as26_amount for r in suggested_results)
         unmatched_amount = sum(e.amount for e in unmatched_entries)
-        control_totals = compute_control_totals(total_26as_amount, matched_amount, unmatched_amount)
+        control_totals = compute_control_totals(total_26as_amount, matched_amount, unmatched_amount, suggested_amount)
         match_rate = (len(matched_results) / len(as26_entries) * 100) if as26_entries else 0.0
         high_conf = sum(1 for r in matched_results if r.confidence == "HIGH")
         med_conf = sum(1 for r in matched_results if r.confidence == "MEDIUM")
@@ -844,7 +907,13 @@ async def run_reconciliation_on_existing_run(
             if entry.index in seen_unmatched_idx:
                 continue
             seen_unmatched_idx.add(entry.index)
-            reason_code, reason_detail = _determine_unmatched_reason(entry, remaining_books, noise_threshold=effective_noise)
+            reason_code, reason_detail = _determine_unmatched_reason(
+                entry, remaining_books,
+                noise_threshold=effective_noise,
+                all_books=book_entries,
+                consumed_book_indices=consumed_book_indices,
+                match_cfg=match_cfg,
+            )
             db.add(Unmatched26AS(
                 run_id=run.id,
                 as26_row_hash=_hash_as26_idx(entry.index, entry.amount, entry.section, entry.tan),
@@ -882,7 +951,7 @@ async def run_reconciliation_on_existing_run(
         blocking_exceptions = [e for e in exc_dicts if e.get("severity") not in ("INFO",)]
         needs_review = (
             bool(blocking_exceptions)
-            or match_rate < 50.0
+            or match_rate < AUTO_APPROVAL_MIN_MATCH_RATE
             or len(matched_results) == 0
         )
         run.status = "PENDING_REVIEW" if needs_review else "APPROVED"
@@ -901,6 +970,7 @@ async def run_reconciliation_on_existing_run(
         run.medium_confidence_count = med_conf
         run.low_confidence_count = low_conf
         run.total_26as_amount = total_26as_amount
+        run.total_sap_amount = round(total_sap_amount, 2)
         run.matched_amount = matched_amount
         run.unmatched_26as_amount = unmatched_amount
         run.control_total_balanced = control_totals["balanced"]

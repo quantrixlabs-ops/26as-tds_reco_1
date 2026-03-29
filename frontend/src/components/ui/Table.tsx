@@ -89,7 +89,7 @@ export function Table<T extends object>({
 
   return (
     <div className={cn('w-full overflow-x-auto', className)}>
-      <table className="w-full text-sm">
+      <table className="w-full text-sm" role="table">
         <thead
           className={cn(
             'border-b border-gray-200 bg-gray-50',
@@ -107,6 +107,12 @@ export function Table<T extends object>({
                   col.headerClassName,
                 )}
                 onClick={col.sortable ? () => handleSort(col.key) : undefined}
+                aria-sort={
+                  col.sortable && sortKey === col.key
+                    ? sortDir === 'asc' ? 'ascending' : 'descending'
+                    : undefined
+                }
+                scope="col"
               >
                 <span className="inline-flex items-center gap-1">
                   {col.header}
@@ -133,7 +139,7 @@ export function Table<T extends object>({
             <tr>
               <td
                 colSpan={columns.length}
-                className="px-4 py-12 text-center text-gray-400 text-sm"
+                className="px-4 py-12 text-center text-gray-500 text-sm"
               >
                 {emptyMessage}
               </td>

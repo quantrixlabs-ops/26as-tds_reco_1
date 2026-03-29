@@ -9,7 +9,7 @@ Strategy (three-tier):
 
   Tier 2 — Smart combo matching (date-clustered greedy accumulation + subset-sum DP):
     Applied to COMBO candidates (multiple invoices -> one 26AS entry).
-    Prefers date-proximate books, respects Section 199 constraint.
+    Prefers date-proximate books, respects over-claim prevention constraint (books ≤ 26AS).
 
   Tier 3 — Force matching (unified):
     All results go to suggested matches for CA review.
@@ -46,6 +46,7 @@ from engine.scorer import score_candidate, BookCandidate, ScoreBreakdown, _parse
 from config import (
     MAX_COMBO_SIZE,
     VARIANCE_CAP_SINGLE,
+    VARIANCE_CAP_COMBO,
     VARIANCE_CAP_FORCE_SINGLE,
     FORCE_COMBO_MAX_INVOICES,
     FORCE_COMBO_MAX_VARIANCE,
@@ -155,7 +156,8 @@ def _categorize_suggested(var_pct: float, date_category: str, cfg: MatchConfig) 
         return "HIGH_VARIANCE_20_PLUS", True  # mandatory remarks
     if var_pct > cfg.variance_normal_ceiling_pct:
         return "HIGH_VARIANCE_3_20", False
-    return "HIGH_VARIANCE_3_20", False
+    # Within normal ceiling but above tier-specific cap (e.g. SINGLE 2%)
+    return "TIER_CAP_EXCEEDED", False
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -299,10 +301,9 @@ def run_global_optimizer(
             r.match_type = f"PRIOR_{r.match_type}"
             r.suggested = True
             r.suggested_category = "CROSS_FY"
-            # Boundary-zone exception: if 26AS date is within 60 days of FY boundary
-            # (April 1 or March 31), treat as MEDIUM confidence instead of LOW
+            # All PRIOR_* matches are LOW confidence per spec — CA must review
+            r.confidence = "LOW"
             is_boundary = _is_fy_boundary_zone(r.as26_date, days=60)
-            r.confidence = "MEDIUM" if is_boundary else "LOW"
             if is_boundary:
                 r.alert_message = (
                     f"Cross-FY match in boundary zone (within 60 days of FY boundary). "
@@ -596,9 +597,9 @@ def _phase_b_global(
               f"Built {len(all_candidates)} single candidates. Running bipartite...")
 
     # Split: normal candidates (for bipartite) vs suggested candidates
-    # Auto-confirm ceiling: entries up to this variance go through bipartite (auto-confirmed)
-    # Only entries above this ceiling become suggested
-    auto_confirm_cap = getattr(cfg, 'variance_auto_confirm_ceiling_pct', cfg.variance_suggested_ceiling_pct)
+    # Auto-confirm ceiling: matches within admin's variance_normal_ceiling are auto-confirmed.
+    # Only entries above this ceiling become suggested for CA review.
+    auto_confirm_cap = cfg.variance_normal_ceiling_pct
     normal_candidates: Dict[Tuple[int, int], Tuple] = {}
     soft_candidates: Dict[Tuple[int, int], Tuple] = {}
 
@@ -626,17 +627,40 @@ def _phase_b_global(
     else:
         bip_matched, bip_unmatched, bip_used = [], list(as26_entries), set()
 
-    # Flag auto-confirmed high-variance matches (above normal ceiling but within auto-confirm)
+    # Enforce admin-configured variance ceiling — matches within cfg.variance_normal_ceiling_pct
+    # are auto-confirmed. Above the ceiling → reclassified to suggested for CA review.
+    # VARIANCE_CAP_SINGLE (2%) is the "clean" threshold — below it, no flag. Above it but
+    # within the admin ceiling → auto-confirmed WITH a high-variance flag/exception.
+    confirmed_bip: List[AssignmentResult] = []
+    reclassified_bip: List[AssignmentResult] = []
+    effective_ceiling = cfg.variance_normal_ceiling_pct  # admin-configured ceiling
     for r in bip_matched:
-        if r.variance_pct > cfg.variance_normal_ceiling_pct:
-            r.alert_message = (
-                f"Auto-confirmed at {r.variance_pct:.1f}% variance "
-                f"(above {cfg.variance_normal_ceiling_pct}% normal ceiling)"
-            )
+        if r.variance_pct > effective_ceiling:
+            # Above admin ceiling — reclassify to suggested for CA review
+            cat, req = _categorize_suggested(r.variance_pct, "", cfg)
+            r.suggested = True
+            r.suggested_category = cat
+            r.requires_remarks = req
+            r.confidence = "LOW"
             r.ai_risk_flag = True
-            r.ai_risk_reason = f"High variance auto-confirmed: {r.variance_pct:.1f}%"
+            r.ai_risk_reason = f"Above admin ceiling: {r.variance_pct:.1f}% > {effective_ceiling}%"
+            if not r.alert_message:
+                r.alert_message = f"Variance {r.variance_pct:.1f}% exceeds ceiling ({effective_ceiling}%)"
+            reclassified_bip.append(r)
+        else:
+            # Within admin ceiling — auto-confirmed
+            if r.variance_pct > VARIANCE_CAP_SINGLE:
+                # Above base tier cap but within admin ceiling — flag for awareness
+                r.alert_message = (
+                    f"Auto-confirmed at {r.variance_pct:.1f}% variance "
+                    f"(above base {VARIANCE_CAP_SINGLE}% cap, within admin ceiling {effective_ceiling}%)"
+                )
+                r.ai_risk_flag = True
+                r.ai_risk_reason = f"High variance auto-confirmed: {r.variance_pct:.1f}%"
+            confirmed_bip.append(r)
 
-    results: List[AssignmentResult] = list(bip_matched)
+    results: List[AssignmentResult] = confirmed_bip
+    # All bipartite-assigned books remain consumed (assignment is globally optimal)
     used_book_indices.update(bip_used)
     consumed_invoice_refs.update(bip_used)
 
@@ -669,6 +693,10 @@ def _phase_b_global(
             days_gap=days_gap,
         ))
 
+    # Merge reclassified bipartite results into suggestions
+    for r in reclassified_bip:
+        suggested.append(r)
+
     # Deduplicate suggested: keep only the best suggestion per as26 entry
     best_suggested: Dict[int, AssignmentResult] = {}
     for s in suggested:
@@ -679,9 +707,9 @@ def _phase_b_global(
             best_suggested[s.as26_index] = s
     suggested = [best_suggested[k] for k in sorted(best_suggested.keys())]  # deterministic order
 
-    # Combo matching for remaining unmatched (exclude those that have suggestions)
-    suggested_as26_ids = {s.as26_index for s in suggested}
-    combo_unmatched = [e for e in bip_unmatched if e.index not in suggested_as26_ids]
+    # Combo matching for ALL unmatched — don't exclude entries with single suggestions,
+    # because a combo at 1% may be far better than a single suggestion at 15%
+    combo_unmatched = list(bip_unmatched)
     if combo_unmatched:
         _progress("PHASE_B_COMBO", 0, len(combo_unmatched),
                   matched_so_far + len(results),
@@ -694,6 +722,11 @@ def _phase_b_global(
                   matched_so_far + len(results),
                   f"Combo done: {_count_normal(combo_results)} matched, "
                   f"{_count_suggested(combo_results)} suggested.")
+
+        # If an entry got both a single suggestion AND a combo result, always prefer
+        # the combo (its books are already committed; keeping both causes invariant violation)
+        combo_as26_ids = {r.as26_index for r in combo_results}
+        suggested = [s for s in suggested if s.as26_index not in combo_as26_ids]
     else:
         final_unmatched = []
 
@@ -766,7 +799,7 @@ def _build_single_candidates(
 
             var_pct = (target - b.amount) / target * 100
             if var_pct < 0:
-                continue  # books > target = Section 199 violation, skip
+                continue  # books > target = over-claim prevention, skip
 
             match_type = "EXACT" if var_pct <= exact_threshold else "SINGLE"
 
@@ -920,7 +953,7 @@ def _smart_combo_match(
     Hard timeout guard: if combo matching takes too long, bail out gracefully.
     """
     import time
-    COMBO_TIMEOUT_SECONDS = 30  # Hard cap — prevent runaway combo matching
+    from config import COMBO_TIMEOUT_SECONDS
 
     results: List[AssignmentResult] = []
     unmatched: List[As26Entry] = []
@@ -973,13 +1006,14 @@ def _smart_combo_match(
 
         max_size = cfg.max_combo_size if cfg.max_combo_size > 0 else len(eligible)
 
-        # Try greedy accumulation first
-        best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size)
+        # Try greedy accumulation first — use admin ceiling for combo acceptance
+        combo_ceiling = cfg.variance_normal_ceiling_pct
+        best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
 
         if best_result is None:
             # Try subset-sum DP on the pool
             amounts = [b.amount for b, _, _ in eligible]
-            dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size)
+            dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
             if dp_indices is not None:
                 best_result = [eligible[i] for i in dp_indices]
 
@@ -990,7 +1024,7 @@ def _smart_combo_match(
             var_pct = (target - books_sum) / target * 100 if target > 0 else 100.0
 
             if var_pct < 0:
-                # books_sum > target: Section 199 violation, skip
+                # books_sum > target: over-claim prevention, skip
                 unmatched.append(as26)
                 continue
 
@@ -1020,10 +1054,8 @@ def _smart_combo_match(
             if worst_date_cat == "DATE_SOFT_PREFERENCE":
                 alert = "Contains invoices 90-180 days from 26AS date"
 
-            # Route based on variance and date category
-            # Auto-confirm up to auto_confirm_ceiling; only route to suggested above that
-            _auto_cap = getattr(cfg, 'variance_auto_confirm_ceiling_pct', cfg.variance_suggested_ceiling_pct)
-            is_suggested = var_pct > _auto_cap
+            # Route based on admin ceiling — matches within admin ceiling auto-confirmed
+            is_suggested = var_pct > cfg.variance_normal_ceiling_pct
 
             if is_suggested:
                 cat, req_remarks = _categorize_suggested(var_pct, worst_date_cat, cfg)
@@ -1074,11 +1106,20 @@ def _greedy_accumulate(
     eligible: List[Tuple[BookEntry, Optional[int], str]],
     tolerance: float,
     max_size: int,
+    variance_ceiling: float = 20.0,
 ) -> Optional[List[Tuple[BookEntry, Optional[int], str]]]:
-    """Greedy: add closest-date books until approaching target. Returns list of
-    (book, days_gap, date_cat) tuples or None if no valid accumulation found."""
+    """Greedy: add closest-date books, tracking the tightest accumulation.
+
+    Does NOT return early at the first viable result — continues accumulating
+    to find the tightest possible combo (lowest variance).
+
+    Returns list of (book, days_gap, date_cat) tuples or None if no valid
+    accumulation found within variance_ceiling.
+    """
     accumulated: List[Tuple[BookEntry, Optional[int], str]] = []
     running_sum = 0.0
+    best_result: Optional[List[Tuple[BookEntry, Optional[int], str]]] = None
+    best_var_pct = float('inf')
 
     for item in eligible:
         b, days_gap, date_cat = item
@@ -1087,20 +1128,18 @@ def _greedy_accumulate(
         accumulated.append(item)
         running_sum += b.amount
 
-        # Check if we're close enough (within suggested ceiling, ~20%)
         var_pct = (target - running_sum) / target * 100 if target > 0 else 100.0
-        if var_pct <= 20.0 and var_pct >= 0:
-            return list(accumulated)
+        if 0 <= var_pct < best_var_pct:
+            best_var_pct = var_pct
+            best_result = list(accumulated)
 
         # Apply max combo size
         if len(accumulated) >= max_size:
             break
 
-    # Check final accumulated state
-    if accumulated:
-        var_pct = (target - running_sum) / target * 100 if target > 0 else 100.0
-        if 0 <= var_pct <= 20.0:  # within suggested ceiling and Section 199 compliant
-            return list(accumulated)
+    # Return the tightest accumulation found, if within variance ceiling
+    if best_result is not None and best_var_pct <= variance_ceiling:
+        return best_result
 
     return None
 
@@ -1110,6 +1149,7 @@ def _subset_sum_dp(
     amounts: List[float],
     tolerance: float,
     max_size: int,
+    variance_ceiling: float = 20.0,
 ) -> Optional[List[int]]:
     """DP approach: find subset of amounts closest to target without exceeding it.
     Returns indices of selected items, or None if no valid subset found.
@@ -1202,10 +1242,10 @@ def _subset_sum_dp(
             return None
         best_j = best_j_multi
 
-    # Check variance is within suggested ceiling (20%)
+    # Check variance is within ceiling
     approx_sum = best_j / scale if scale == 100 else best_j  # approximate
     approx_var = (target - approx_sum) / target * 100 if target > 0 else 100.0
-    if approx_var > 20.0 or approx_var < -0.1:
+    if approx_var > variance_ceiling or approx_var < -0.1:
         return None
 
     # Traceback to find which items were selected
@@ -1246,7 +1286,11 @@ def _force_match_one(
     for idx in range(hi):
         b = available[idx]
         days_gap = _compute_days_gap(a_date, b.doc_date)
-        eligible.append((b, days_gap if days_gap is not None else 999, ""))
+        gap = days_gap if days_gap is not None else 999
+        # Force matches beyond 365 days are unreliable — skip
+        if abs(gap) > 365:
+            continue
+        eligible.append((b, gap, ""))
 
     if not eligible:
         return None, True
@@ -1263,10 +1307,10 @@ def _force_match_one(
     )
 
     # Try greedy accumulation first (allows single + combo, capped at max_size_combo)
-    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size_combo)
+    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size_combo, variance_ceiling=FORCE_COMBO_MAX_VARIANCE)
     if best_result is None:
         amounts = [b.amount for b, _, _ in eligible]
-        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size_combo)
+        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size_combo, variance_ceiling=FORCE_COMBO_MAX_VARIANCE)
         if dp_indices is not None:
             best_result = [eligible[idx] for idx in dp_indices]
 
@@ -1302,7 +1346,7 @@ def _force_match_one(
     var_pct = (target - books_sum) / target * 100 if target > 0 else 100.0
 
     if var_pct < 0:
-        return None, True  # Section 199 violation
+        return None, True  # over-claim prevention: books exceed 26AS amount
 
     combo_size = len(books)
 
@@ -1429,6 +1473,11 @@ def _phase_c_force_unified(
         else:
             # Defensive: result is None but not flagged as unmatched — treat as unmatched
             unmatched.append(as26)
+
+    # Propagate consumed books back to caller so Phase E and later phases
+    # don't reuse books that were force-matched in Phase C
+    used_book_indices.update(consumed_indices)
+    consumed_invoice_refs.update(consumed_indices)
 
     _progress(total, f"Force matching done: {len(suggested)} suggested")
     return suggested, unmatched

@@ -19,6 +19,7 @@ import { cn, getErrorMessage, formatFY } from '../lib/utils';
 import { Card } from '../components/ui/Card';
 import { Spinner } from '../components/ui/Spinner';
 import { useToast } from '../components/ui/Toast';
+import { PageWrapper } from '../components/ui/PageHeader';
 
 // ── Shared sub-components ─────────────────────────────────────────────────────
 
@@ -327,7 +328,7 @@ function SingleUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDef
 
         <div className="bg-amber-50 border border-amber-100 rounded-lg px-4 py-3 text-xs text-amber-700 leading-relaxed">
           <strong>Note:</strong> Only Status=F (Final) entries from Form 26AS will be processed.
-          The algorithm enforces Section 199 constraints: books_sum must not exceed the 26AS credit amount.
+          The algorithm enforces over-claim prevention: books_sum must not exceed the 26AS credit amount.
         </div>
 
         <div className="flex items-center gap-3 pt-2">
@@ -820,11 +821,14 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
       const result = await runsApi.batchPreview(sapFiles, as26File);
       setMappings(result.mappings);
       setAllParties(result.all_parties);
-      // Seed overrides from auto-confirmed
+      // Seed overrides from auto-confirmed AND pending (top candidate pre-selected for review)
       const seed: Record<string, Array<{ deductor_name: string; tan: string }>> = {};
       for (const m of result.mappings) {
         if (m.confirmed_name && m.confirmed_tan) {
           seed[m.sap_filename] = [{ deductor_name: m.confirmed_name, tan: m.confirmed_tan }];
+        } else if (m.status === 'PENDING' && m.top_candidates.length > 0) {
+          const top = m.top_candidates[0];
+          seed[m.sap_filename] = [{ deductor_name: top.deductor_name, tan: top.tan }];
         }
       }
       setOverrides(seed);
@@ -1129,7 +1133,7 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
 
                   {/* Multi-select dropdown */}
                   {openDropdown === m.sap_filename && (
-                    <div className="absolute left-0 top-full mt-1 z-30 w-80 bg-white border border-gray-200 rounded-xl shadow-xl overflow-hidden">
+                    <div className="absolute left-0 top-full mt-1 z-30 w-[28rem] bg-white border border-gray-200 rounded-xl shadow-xl overflow-hidden">
                       {/* Search */}
                       <div className="px-3 py-2 border-b border-gray-100">
                         <input
@@ -1142,7 +1146,7 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
                         />
                       </div>
                       {/* Checkbox list */}
-                      <div className="max-h-48 overflow-y-auto">
+                      <div className="max-h-72 overflow-y-auto">
                         {allParties
                           .filter((p) =>
                             dropdownSearch === '' ||
@@ -1169,7 +1173,7 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
                                   {checked && <Check className="h-2.5 w-2.5 text-white" />}
                                 </span>
                                 <div className="flex-1 text-left min-w-0">
-                                  <p className="font-medium text-gray-800 truncate">{p.deductor_name}</p>
+                                  <p className="font-medium text-gray-800 break-words">{p.deductor_name}</p>
                                   <p className="text-xs text-gray-400">{p.tan} · {p.entry_count} entries</p>
                                 </div>
                               </button>
@@ -1291,7 +1295,7 @@ export default function NewRunPage() {
   const fyDefault = fyData?.default ?? fyOptions[fyOptions.length - 1] ?? '';
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <PageWrapper className="max-w-2xl mx-auto">
       {/* Header */}
       <div>
         <h1 className="text-xl font-bold text-gray-900">New Reconciliation Run</h1>
@@ -1347,6 +1351,6 @@ export default function NewRunPage() {
       ) : (
         <BatchUploadForm fyOptions={fyOptions} fyDefault={fyDefault} />
       )}
-    </div>
+    </PageWrapper>
   );
 }

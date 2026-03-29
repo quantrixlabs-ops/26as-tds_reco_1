@@ -255,25 +255,27 @@ def _build_matched(ws, pairs: List[MatchedPair], run: ReconciliationRun):
     conf_colors = {"HIGH": CONF_HIGH, "MEDIUM": CONF_MED, "LOW": CONF_LOW}
 
     for r, p in enumerate(pairs, 3):
-        conf_color = conf_colors.get(p.confidence, "FFFFFF")
-        var_color = VAR_GREEN if p.variance_pct <= 1 else VAR_YELLOW if p.variance_pct <= 3 else VAR_RED
-        score_color = CONF_HIGH if p.composite_score >= 80 else CONF_MED if p.composite_score >= 60 else CONF_LOW
+        conf_color = conf_colors.get(p.confidence or "", "FFFFFF")
+        var_pct = p.variance_pct or 0
+        score = p.composite_score or 0
+        var_color = VAR_GREEN if var_pct <= 1 else VAR_YELLOW if var_pct <= 3 else VAR_RED
+        score_color = CONF_HIGH if score >= 80 else CONF_MED if score >= 60 else CONF_LOW
 
         ws.cell(r, 1, r - 2).alignment = _align("center")
         ws.cell(r, 2, p.as26_date or "—")
-        ws.cell(r, 3, p.section).alignment = _align("center")
-        ws.cell(r, 4, p.as26_amount).number_format = '#,##0.00'
-        ws.cell(r, 5, p.books_sum).number_format = '#,##0.00'
-        ws.cell(r, 6, p.variance_amt).fill = _fill(var_color); ws.cell(r, 6).number_format = '#,##0.00'
-        ws.cell(r, 7, f"{p.variance_pct:.2f}%").fill = _fill(var_color)
-        ws.cell(r, 8, p.match_type)
-        ws.cell(r, 9, p.confidence).fill = _fill(conf_color)
-        ws.cell(r, 10, f"{p.composite_score:.1f}").fill = _fill(score_color)
+        ws.cell(r, 3, p.section or "—").alignment = _align("center")
+        ws.cell(r, 4, p.as26_amount or 0).number_format = '#,##0.00'
+        ws.cell(r, 5, p.books_sum or 0).number_format = '#,##0.00'
+        ws.cell(r, 6, p.variance_amt or 0).fill = _fill(var_color); ws.cell(r, 6).number_format = '#,##0.00'
+        ws.cell(r, 7, f"{var_pct:.2f}%").fill = _fill(var_color)
+        ws.cell(r, 8, p.match_type or "—")
+        ws.cell(r, 9, p.confidence or "—").fill = _fill(conf_color)
+        ws.cell(r, 10, f"{score:.1f}").fill = _fill(score_color)
         ws.cell(r, 11, ", ".join(p.invoice_refs or []))
         ws.cell(r, 12, p.clearing_doc or "—")
-        ws.cell(r, 13, "✓" if p.cross_fy else "").alignment = _align("center")
-        ws.cell(r, 14, "⚠" if p.ai_risk_flag else "").alignment = _align("center")
-        ws.cell(r, 15, "✓" if p.is_prior_year else "").alignment = _align("center")
+        ws.cell(r, 13, "Y" if p.cross_fy else "").alignment = _align("center")
+        ws.cell(r, 14, "!" if p.ai_risk_flag else "").alignment = _align("center")
+        ws.cell(r, 15, "Y" if p.is_prior_year else "").alignment = _align("center")
 
     widths = [5, 14, 10, 16, 16, 14, 12, 18, 11, 14, 35, 16, 10, 9, 12]
     for i, w in enumerate(widths, 1):
@@ -391,13 +393,14 @@ def generate_batch_excel(
         total_matched_all += run.matched_count or 0
         total_26as_all += run.total_26as_entries or 0
 
-        rate_color = VAR_GREEN if run.match_rate_pct >= 95 else VAR_YELLOW if run.match_rate_pct >= 75 else VAR_RED
+        rate = run.match_rate_pct or 0
+        rate_color = VAR_GREEN if rate >= 95 else VAR_YELLOW if rate >= 75 else VAR_RED
 
         ws_summary.cell(idx, 1, idx - 2).alignment = _align("center")
         ws_summary.cell(idx, 2, run.deductor_name or "—")
         ws_summary.cell(idx, 3, run.tan or "—").alignment = _align("center")
-        ws_summary.cell(idx, 4, run.status)
-        rate_cell = ws_summary.cell(idx, 5, f"{run.match_rate_pct:.2f}%")
+        ws_summary.cell(idx, 4, run.status or "—")
+        rate_cell = ws_summary.cell(idx, 5, f"{rate:.2f}%")
         rate_cell.fill = _fill(rate_color)
         rate_cell.alignment = _align("center")
         ws_summary.cell(idx, 6, run.matched_count or 0).alignment = _align("center")
@@ -462,13 +465,17 @@ def generate_batch_excel(
                 seen_hashes.add(h)
             matched_pairs.append(mp)
 
-        # Excel sheet names max 31 chars, must be unique
-        sheet_name = (run.deductor_name or run.tan or f"Run-{run.run_number}")[:31]
+        # Excel sheet names max 31 chars, must be unique, no invalid chars
+        raw_name = run.deductor_name or run.tan or f"Run-{run.run_number}"
+        # Remove chars invalid in Excel sheet names: \ / * ? : [ ]
+        import re
+        safe_name = re.sub(r'[\\/*?:\[\]]', '_', raw_name)
+        sheet_name = safe_name[:31]
         # Ensure uniqueness
         existing = [ws.title for ws in wb.worksheets]
         if sheet_name in existing:
             suffix = f" ({run.run_number})"
-            sheet_name = sheet_name[:31 - len(suffix)] + suffix
+            sheet_name = safe_name[:31 - len(suffix)] + suffix
 
         ws = wb.create_sheet(sheet_name)
         _build_matched(ws, matched_pairs, run)

@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth, useIsAdmin } from '../../lib/auth';
+import { ThemeToggle } from '../ui/ThemeToggle';
+import { KeyboardShortcutsProvider } from '../ui/KeyboardShortcuts';
 
 interface NavItem {
   to: string;
@@ -122,8 +124,9 @@ export function AppLayout({ children }: AppLayoutProps) {
         <button
           onClick={handleLogout}
           className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm font-medium text-gray-300 hover:bg-white/10 hover:text-white transition-colors"
+          aria-label="Sign out of your account"
         >
-          <LogOut className="h-4 w-4" />
+          <LogOut className="h-4 w-4" aria-hidden="true" />
           Sign out
         </button>
       </div>
@@ -132,22 +135,33 @@ export function AppLayout({ children }: AppLayoutProps) {
 
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
+      {/* Skip to content link (a11y) */}
+      <a href="#main-content" className="skip-link">
+        Skip to content
+      </a>
+
       {/* Desktop sidebar */}
-      <aside className="hidden lg:flex flex-col w-56 bg-[#152E4D] shrink-0">
+      <aside
+        className="hidden lg:flex flex-col w-56 bg-[#152E4D] shrink-0"
+        role="navigation"
+        aria-label="Main navigation"
+      >
         <SidebarContent />
       </aside>
 
       {/* Mobile sidebar overlay */}
       {sidebarOpen && (
-        <div className="lg:hidden fixed inset-0 z-40 flex">
+        <div className="lg:hidden fixed inset-0 z-40 flex" role="dialog" aria-modal="true" aria-label="Navigation menu">
           <div
             className="absolute inset-0 bg-black/40"
             onClick={() => setSidebarOpen(false)}
+            aria-hidden="true"
           />
-          <aside className="relative z-50 flex flex-col w-56 bg-[#152E4D]">
+          <aside className="relative z-50 flex flex-col w-56 bg-[#152E4D]" role="navigation" aria-label="Mobile navigation">
             <button
               className="absolute top-4 right-4 text-white/70 hover:text-white"
               onClick={() => setSidebarOpen(false)}
+              aria-label="Close navigation menu"
             >
               <X className="h-5 w-5" />
             </button>
@@ -159,26 +173,31 @@ export function AppLayout({ children }: AppLayoutProps) {
       {/* Main */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Top bar */}
-        <header className="bg-white border-b border-gray-200 px-4 lg:px-6 py-3 flex items-center gap-4 shrink-0">
+        <header className="bg-white border-b border-gray-200 px-4 lg:px-6 py-3 flex items-center gap-4 shrink-0" role="banner">
           <button
             className="lg:hidden text-gray-500 hover:text-gray-700"
             onClick={() => setSidebarOpen(true)}
+            aria-label="Open navigation menu"
           >
             <Menu className="h-5 w-5" />
           </button>
           <div className="flex-1" />
-          <div className="flex items-center gap-2 text-xs text-gray-400">
+          <ThemeToggle />
+          <div className="flex items-center gap-2 text-xs text-gray-500" aria-label={`Logged in as ${user?.full_name}, role: ${user?.role}`}>
             <span className="font-medium text-gray-700">{user?.full_name}</span>
-            <span>·</span>
+            <span aria-hidden="true">·</span>
             <span>{user?.role}</span>
           </div>
         </header>
 
         {/* Page content */}
-        <main className="flex-1 overflow-y-auto">
+        <main id="main-content" className="flex-1 overflow-y-auto" role="main">
           <div className="max-w-7xl mx-auto px-4 lg:px-6 py-6">{children}</div>
         </main>
       </div>
+
+      {/* Keyboard shortcuts overlay */}
+      <KeyboardShortcutsProvider />
     </div>
   );
 }

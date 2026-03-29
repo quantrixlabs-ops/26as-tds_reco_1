@@ -75,8 +75,8 @@ def test_high_variance_generates_exception():
     exc = generate_exceptions(matched, [], _empty_val_report(), "run-1")
     hv_exc = [e for e in exc if e["exception_type"] == "HIGH_VARIANCE"]
     assert len(hv_exc) == 1
-    # Non-suggested matches get INFO severity (auto-confirmed audit trail)
-    assert hv_exc[0]["severity"] == "INFO"
+    # Non-suggested (auto-confirmed) high-variance matches get LOW severity (blocks auto-approval)
+    assert hv_exc[0]["severity"] == "LOW"
 
 
 def test_high_variance_suggested_gets_medium():

@@ -148,28 +148,26 @@ def test_variance_pct_zero_as26():
 
 # ── Tier-specific variance caps (Brief §3/#4) ────────────────────────────────
 
-def test_single_above_2pct_auto_confirmed():
-    """SINGLE at 2.5% variance should be auto-confirmed (within 20% auto-confirm ceiling).
-    Pre-#4 this went to suggested; post-#4 it's auto-matched within the expanded bipartite."""
+def test_single_above_2pct_within_admin_ceiling_auto_confirmed():
+    """SINGLE at 2.5% variance is above base cap (2%) but within default admin ceiling (3%) — auto-confirmed with flag."""
     as26 = [_as26(0, 100000.0)]
-    books = [_book(0, 97500.0)]  # 2.5% variance — above SINGLE cap (2%), below auto-confirm ceiling (20%)
+    books = [_book(0, 97500.0)]  # 2.5% variance — above base 2% but within default 3% ceiling
     all_results, unmatched = run_global_optimizer(as26, books, books, [])
     matched, suggested = _split_results(all_results)
-    # Should be auto-confirmed (within auto-confirm ceiling of 20%)
     assert len(matched) == 1
     assert matched[0].variance_pct == pytest.approx(2.5, abs=0.1)
+    assert matched[0].ai_risk_flag is True  # flagged because above base VARIANCE_CAP_SINGLE
 
 
-def test_single_above_normal_ceiling_gets_risk_flag():
-    """SINGLE at 5% variance (above 3% normal ceiling) should be auto-confirmed but flagged."""
+def test_single_above_normal_ceiling_goes_to_suggested():
+    """SINGLE at 5% variance exceeds admin ceiling (default 3%) — routed to suggested."""
     as26 = [_as26(0, 100000.0)]
-    books = [_book(0, 95000.0)]  # 5% variance — above normal ceiling (3%), below auto-confirm (20%)
+    books = [_book(0, 95000.0)]  # 5% variance — above default 3% admin ceiling
     all_results, unmatched = run_global_optimizer(as26, books, books, [])
     matched, suggested = _split_results(all_results)
-    assert len(matched) == 1
-    assert matched[0].variance_pct == pytest.approx(5.0, abs=0.1)
-    assert matched[0].ai_risk_flag is True
-    assert "Auto-confirmed" in (matched[0].alert_message or "")
+    assert len(suggested) == 1
+    assert suggested[0].variance_pct == pytest.approx(5.0, abs=0.1)
+    assert suggested[0].suggested is True
 
 
 def test_single_within_2pct_auto_matched():
@@ -244,24 +242,24 @@ def test_force_combo_above_2pct_rejected():
     assert len(force_results) == 0
 
 
-# ── Section 199 attack: books > 26AS ─────────────────────────────────────────
+# ── Over-claim prevention: books > 26AS ──────────────────────────────────────
 
 def test_books_exceeding_26as_never_matched():
-    """Books sum > 26AS amount must NEVER produce a match (Section 199 hard constraint)."""
+    """Books sum > 26AS amount must NEVER produce a match (over-claim prevention)."""
     as26 = [_as26(0, 100000.0)]
     # Book slightly exceeds target — must be rejected, not abs()-converted
     books = [_book(0, 100001.0)]
     all_results, unmatched = run_global_optimizer(as26, books, books, [])
     matched, suggested = _split_results(all_results)
-    # Verify Section 199: no match should have books_sum > as26_amount
+    # Verify over-claim rule: no match should have books_sum > as26_amount
     for r in matched + suggested:
         books_sum = sum(b.amount for b in r.books)
         assert books_sum <= r.as26_amount + 0.02, \
-            f"Section 199 VIOLATION: books_sum {books_sum} > as26_amount {r.as26_amount}"
+            f"OVER-CLAIM VIOLATION: books_sum {books_sum} > as26_amount {r.as26_amount}"
 
 
 def test_books_at_exact_tolerance_boundary():
-    """Book at target + exact_tolerance boundary: should NOT match (Section 199)."""
+    """Book at target + exact_tolerance boundary: should NOT match (over-claim prevention)."""
     as26 = [_as26(0, 100000.0)]
     # Book = target + 0.01 (exact_tolerance) — right at boundary
     books = [_book(0, 100000.01)]
@@ -274,28 +272,26 @@ def test_books_at_exact_tolerance_boundary():
 
 # ── #4: Auto-confirm 3-20% variance ──────────────────────────────────────────
 
-def test_10pct_variance_auto_confirmed():
-    """10% variance should be auto-confirmed (within 20% auto-confirm ceiling)."""
+def test_4pct_variance_goes_to_suggested():
+    """4% variance exceeds SINGLE tier cap (2%) — reclassified as suggested."""
     as26 = [_as26(0, 100000.0)]
-    books = [_book(0, 90000.0)]  # 10% variance
+    books = [_book(0, 96000.0)]  # 4% variance — above SINGLE cap (2%)
     all_results, unmatched = run_global_optimizer(as26, books, books, [])
     matched, suggested = _split_results(all_results)
-    assert len(matched) == 1
-    assert matched[0].variance_pct == pytest.approx(10.0, abs=0.1)
-    # Should be flagged as high-variance auto-confirm
-    assert matched[0].ai_risk_flag is True
+    assert len(suggested) == 1
+    assert suggested[0].variance_pct == pytest.approx(4.0, abs=0.1)
+    assert suggested[0].suggested is True
 
 
-def test_25pct_variance_goes_to_suggested():
-    """25% variance should NOT be auto-confirmed (above 20% ceiling) — goes to suggested."""
+def test_10pct_variance_goes_to_suggested():
+    """10% variance should NOT be auto-confirmed (above 5% ceiling) — goes to suggested or unmatched."""
     as26 = [_as26(0, 100000.0)]
-    books = [_book(0, 75000.0)]  # 25% variance — above auto-confirm ceiling
+    books = [_book(0, 90000.0)]  # 10% variance — above 5% auto-confirm ceiling
     all_results, unmatched = run_global_optimizer(as26, books, books, [])
     matched, suggested = _split_results(all_results)
-    # Should not be auto-confirmed
+    # Should not be auto-confirmed at 10% (ceiling is 5%)
     assert len(matched) == 0
-    # Note: may go to suggested via force match or just be unmatched
-    # 25% is above the 20% suggested ceiling too, so likely unmatched
+    # May go to suggested via force match or remain unmatched
 
 
 # ── #5: Directional date tolerance ────────────────────────────────────────────

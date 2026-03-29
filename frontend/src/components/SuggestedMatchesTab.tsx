@@ -39,7 +39,7 @@ interface CategoryMeta {
   customClass?: string;
 }
 
-const CATEGORY_META: Record<SuggestedCategory, CategoryMeta> = {
+const CATEGORY_META: Record<string, CategoryMeta> = {
   HIGH_VARIANCE_3_20: { label: 'Variance 3-20%', variant: 'yellow' },
   HIGH_VARIANCE_20_PLUS: { label: 'Variance 20%+', variant: 'red' },
   DATE_SOFT_PREFERENCE: { label: 'Date Pref.', variant: 'blue' },
@@ -50,6 +50,7 @@ const CATEGORY_META: Record<SuggestedCategory, CategoryMeta> = {
   },
   FORCE: { label: 'Force', variant: 'orange' },
   CROSS_FY: { label: 'Cross-FY', variant: 'gray' },
+  TIER_CAP_EXCEEDED: { label: 'Tier Cap', variant: 'yellow' },
 };
 
 const ALL_CATEGORIES: SuggestedCategory[] = [
@@ -59,6 +60,7 @@ const ALL_CATEGORIES: SuggestedCategory[] = [
   'ADVANCE_PAYMENT',
   'FORCE',
   'CROSS_FY',
+  'TIER_CAP_EXCEEDED',
 ];
 
 type FilterValue = 'all' | SuggestedCategory;
@@ -71,7 +73,7 @@ const FILTER_OPTIONS: { value: FilterValue; label: string }[] = [
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function categoryBadge(category: SuggestedCategory, size: 'sm' | 'md' = 'sm') {
-  const meta = CATEGORY_META[category];
+  const meta = CATEGORY_META[category] ?? { label: category, variant: 'gray' as BadgeVariant };
   return (
     <Badge variant={meta.variant} size={size} className={meta.customClass}>
       {meta.label}

@@ -20,6 +20,7 @@ interface BadgeProps {
   children: React.ReactNode;
   className?: string;
   size?: 'sm' | 'md';
+  'aria-label'?: string;
 }
 
 export function Badge({
@@ -27,15 +28,18 @@ export function Badge({
   children,
   className,
   size = 'sm',
+  ...rest
 }: BadgeProps) {
   return (
     <span
+      role="status"
       className={cn(
         'inline-flex items-center font-medium rounded-full border',
         size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1 text-sm',
         variantClasses[variant],
         className,
       )}
+      {...rest}
     >
       {children}
     </span>

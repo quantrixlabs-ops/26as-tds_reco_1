@@ -33,7 +33,7 @@ const PHASES: PhaseInfo[] = [
     rules: [
       'Group size: 2–5 entries (hard cap)',
       'Variance tolerance: ≤3%',
-      'books_sum must not exceed as26_amount (Section 199)',
+      'books_sum must not exceed as26_amount (over-claim prevention)',
     ],
   },
   {

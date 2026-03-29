@@ -29,6 +29,8 @@ import {
   X,
   Search,
   ArrowUpDown,
+  Copy,
+  Check,
 } from 'lucide-react';
 import {
   runsApi,
@@ -42,6 +44,8 @@ import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
 import { FullPageSpinner } from '../components/ui/Spinner';
 import { RunProgressPanel } from '../components/RunProgressPanel';
+import { PageWrapper } from '../components/ui/PageHeader';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import {
   cn,
   formatDate,
@@ -55,11 +59,57 @@ import {
   formatFY,
   getErrorMessage,
   truncate,
+  copyToClipboard,
 } from '../lib/utils';
 import SectionSummaryTab from '../components/SectionSummaryTab';
 import MismatchTrackerTab from '../components/MismatchTrackerTab';
 import MatchingMethodologyPanel from '../components/MatchingMethodologyPanel';
 import SuggestedMatchesTab from '../components/SuggestedMatchesTab';
+
+// ── Copy button ──────────────────────────────────────────────────────────────
+
+function CopyButton({ text, label }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  const { toast } = useToast();
+
+  const handleCopy = async () => {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      setCopied(true);
+      toast('Copied', label ? `${label} copied to clipboard` : 'Copied to clipboard', 'success');
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="inline-flex items-center p-0.5 rounded text-gray-300 hover:text-gray-600 transition-colors"
+      title={`Copy ${label || 'value'}`}
+    >
+      {copied ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+    </button>
+  );
+}
+
+// ── Copyable value ───────────────────────────────────────────────────────────
+
+function Copyable({ value, label, className, children }: {
+  value: string;
+  label?: string;
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const hasTruncate = className?.includes('truncate');
+  return (
+    <span className={cn('inline-flex items-center gap-1 group', hasTruncate ? 'max-w-full' : '', className)}>
+      <span className={hasTruncate ? 'truncate' : undefined}>{children ?? value}</span>
+      <span className="opacity-0 group-hover:opacity-100 transition-opacity print:hidden shrink-0">
+        <CopyButton text={value} label={label} />
+      </span>
+    </span>
+  );
+}
 
 // ── Metadata card ─────────────────────────────────────────────────────────────
 
@@ -69,19 +119,21 @@ function MetadataCard({ run }: { run: RunSummary }) {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-4 text-sm">
         <div>
           <p className="text-xs text-gray-400 mb-0.5">Run Number</p>
-          <p className="font-mono text-gray-900 font-semibold">#{run.run_number}</p>
+          <Copyable value={String(run.run_number)} label="Run number" className="font-mono text-gray-900 font-semibold">
+            #{run.run_number}
+          </Copyable>
         </div>
         <div>
           <p className="text-xs text-gray-400 mb-0.5">Financial Year</p>
           <p className="font-medium text-gray-900">{formatFY(run.financial_year)}</p>
         </div>
-        <div>
+        <div className="min-w-0">
           <p className="text-xs text-gray-400 mb-0.5">Deductor</p>
-          <p className="font-medium text-gray-900 truncate" title={run.deductor_name}>{run.deductor_name}</p>
+          <Copyable value={run.deductor_name} label="Deductor name" className="font-medium text-gray-900 block truncate" />
         </div>
-        <div>
+        <div className="min-w-0">
           <p className="text-xs text-gray-400 mb-0.5">TAN</p>
-          <p className="font-mono text-gray-900">{run.tan}</p>
+          <Copyable value={run.tan} label="TAN" className="font-mono text-gray-900" />
         </div>
         <div>
           <p className="text-xs text-gray-400 mb-0.5">Status</p>
@@ -101,11 +153,11 @@ function MetadataCard({ run }: { run: RunSummary }) {
         </div>
         <div className="col-span-2">
           <p className="text-xs text-gray-400 mb-0.5">SAP File Hash (SHA-256)</p>
-          <p className="font-mono text-xs text-gray-500 break-all">{run.sap_file_hash}</p>
+          <Copyable value={run.sap_file_hash} label="SAP file hash" className="font-mono text-xs text-gray-500 break-all" />
         </div>
         <div className="col-span-2">
           <p className="text-xs text-gray-400 mb-0.5">26AS File Hash (SHA-256)</p>
-          <p className="font-mono text-xs text-gray-500 break-all">{run.as26_file_hash}</p>
+          <Copyable value={run.as26_file_hash} label="26AS file hash" className="font-mono text-xs text-gray-500 break-all" />
         </div>
       </div>
     </Card>
@@ -406,7 +458,7 @@ function MatchedTab({ runId }: { runId: string }) {
               ? <>{sorted.length} of {data.length} pairs</>
               : <>{data.length} matched pairs</>}
             {' · '}
-            <span title="Section 199 compliance: books total never exceeds 26AS credit">Sec 199 compliant</span>
+            <span title="Over-claim check: books total never exceeds 26AS credit">Books ≤ 26AS</span>
           </p>
           {activeFilterCount > 0 && (
             <button
@@ -1221,7 +1273,7 @@ export default function RunDetailPage() {
     run.created_by !== user?.id;
 
   return (
-    <div className="space-y-6">
+    <PageWrapper>
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -1338,75 +1390,31 @@ export default function RunDetailPage() {
         </div>
       </div>
 
-      {/* Delete confirmation modal */}
-      {confirmDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
-                <Trash2 className="h-5 w-5 text-red-600" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-gray-900">Delete Run #{run.run_number}?</h3>
-                <p className="text-xs text-gray-500 mt-0.5">This action cannot be undone</p>
-              </div>
-            </div>
-            <p className="text-sm text-gray-600 mb-5">
-              All matched pairs, exceptions, audit trail entries, and uploaded files for this run will be permanently deleted.
-            </p>
-            <div className="flex gap-3 justify-end">
-              <button
-                onClick={() => setConfirmDelete(false)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => deleteMut.mutate()}
-                disabled={deleteMut.isPending}
-                className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50"
-              >
-                {deleteMut.isPending ? 'Deleting…' : 'Delete permanently'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Delete confirmation dialog */}
+      <ConfirmDialog
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        onConfirm={() => deleteMut.mutate()}
+        title={`Delete Run #${run.run_number}?`}
+        description="All matched pairs, exceptions, audit trail entries, and uploaded files for this run will be permanently deleted. This action cannot be undone."
+        confirmLabel="Delete permanently"
+        variant="danger"
+        loading={deleteMut.isPending}
+        icon={<Trash2 className="h-5 w-5 text-red-600" />}
+      />
 
-      {/* Re-run confirmation modal */}
-      {confirmRerun && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
-                <RotateCw className="h-5 w-5 text-blue-600" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-gray-900">Re-run #{run.run_number}?</h3>
-                <p className="text-xs text-gray-500 mt-0.5">{run.deductor_name}</p>
-              </div>
-            </div>
-            <p className="text-sm text-gray-600 mb-5">
-              A new reconciliation will be created using the same files and settings. The original run will not be modified.
-            </p>
-            <div className="flex gap-3 justify-end">
-              <button
-                onClick={() => setConfirmRerun(false)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => { setConfirmRerun(false); rerunMut.mutate(); }}
-                disabled={rerunMut.isPending}
-                className="px-4 py-2 text-sm font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
-              >
-                {rerunMut.isPending ? 'Starting…' : 'Re-run reconciliation'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Re-run confirmation dialog */}
+      <ConfirmDialog
+        open={confirmRerun}
+        onClose={() => setConfirmRerun(false)}
+        onConfirm={() => { setConfirmRerun(false); rerunMut.mutate(); }}
+        title={`Re-run #${run.run_number}?`}
+        description={`A new reconciliation for ${run.deductor_name} will be created using the same files and settings. The original run will not be modified.`}
+        confirmLabel="Re-run reconciliation"
+        variant="info"
+        loading={rerunMut.isPending}
+        icon={<RotateCw className="h-5 w-5 text-[#1B3A5C]" />}
+      />
 
       {/* Live progress panel — shown while PROCESSING */}
       {run.status === 'PROCESSING' && (
@@ -1497,7 +1505,7 @@ export default function RunDetailPage() {
             </div>
             <div>
               <p className="text-xs text-gray-400 mb-0.5">Total as per Books</p>
-              <p className="text-base font-bold text-gray-800">{formatCurrency(run.matched_amount + (run.total_26as_amount - run.matched_amount - run.unmatched_26as_amount > 0 ? run.total_26as_amount - run.matched_amount - run.unmatched_26as_amount : 0))}</p>
+              <p className="text-base font-bold text-gray-800">{formatCurrency(run.total_sap_amount ?? 0)}</p>
               <p className="text-[10px] text-gray-400">{run.total_sap_entries || 0} SAP entries</p>
             </div>
             <div>
@@ -1676,6 +1684,6 @@ export default function RunDetailPage() {
           <AuditTrailTab runId={id!} />
         </TabsPrimitive.Content>
       </TabsPrimitive.Root>
-    </div>
+    </PageWrapper>
   );
 }

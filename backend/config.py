@@ -35,6 +35,12 @@ FORCE_COMBO_MAX_VARIANCE: float = 2.0  # FORCE_COMBO must be near-exact to be ac
 # Set to True only when the CA explicitly authorises prior-FY matching.
 ALLOW_CROSS_FY: bool = False
 
+# ── Auto-Approval Thresholds ──────────────────────────────────────────────────
+AUTO_APPROVAL_MIN_MATCH_RATE: float = 75.0  # Runs below this match rate require manual review
+MIN_APPROVAL_MATCH_RATE: float = 75.0       # Reviewer cannot approve below this (same for consistency)
+HIGH_VALUE_THRESHOLD: float = 1_000_000     # ₹10 lakh — unmatched 26AS entries above this are CRITICAL
+COMBO_TIMEOUT_SECONDS: int = 30             # Hard cap on combo matching time per entry
+
 # ── Cleaning Pipeline ─────────────────────────────────────────────────────────
 NOISE_THRESHOLD: float = 1.0    # Rows with amount < ₹1 are excluded (keep all meaningful amounts)
 
@@ -124,14 +130,14 @@ class MatchConfig:
 
     # Variance Thresholds
     variance_normal_ceiling_pct: float = 3.0
-    variance_auto_confirm_ceiling_pct: float = 20.0  # Auto-confirm matches up to this variance (with audit flag)
+    variance_auto_confirm_ceiling_pct: float = 5.0  # Auto-confirm matches up to this variance (safety net above tier caps)
     variance_suggested_ceiling_pct: float = 20.0
 
     # Advance Payment
     exclude_sgl_v: bool = True
 
     # Combo Settings
-    max_combo_size: int = 0  # 0 = unlimited
+    max_combo_size: int = 5  # Default to MAX_COMBO_SIZE; 0 = unlimited (not recommended)
     date_clustering_preference: bool = True
 
     # Cross-FY
@@ -146,7 +152,7 @@ class MatchConfig:
 
     # Internals (not user-configurable)
     exact_tolerance: float = 0.01
-    combo_pool_cap: int = 50
+    combo_pool_cap: int = 5000
     combo_iteration_budget: int = 50_000
 
     def to_dict(self) -> dict:

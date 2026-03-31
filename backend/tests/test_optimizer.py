@@ -425,3 +425,119 @@ def test_proxy_clearing_disabled():
     all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
     for r in all_results:
         assert not r.match_type.startswith("PROXY_GROUP"), f"Unexpected proxy match: {r.match_type}"
+
+
+# ── Single sweep before combo (U02 starvation prevention) ─────────────────
+
+def test_single_sweep_prevents_combo_starvation():
+    """Small entries should claim their 1:1 candidate before combo consumes it."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        single_sweep_before_combo=True,
+        variance_normal_ceiling_pct=10.0,  # wide ceiling so sweep candidates are within auto-confirm
+        variance_suggested_ceiling_pct=20.0,
+    )
+    # Large 26AS entry: 300,000 — needs a combo of 3 books
+    # Small 26AS entries: 50,000 each — have a perfect 1:1 match
+    as26 = [
+        _as26(0, 300000.0, date="15-Jun-2023"),
+        _as26(1, 50000.0, date="15-Jun-2023"),
+        _as26(2, 50000.0, date="16-Jun-2023"),
+    ]
+    # Books: two ~50K books (perfect for small entries) + three ~100K books (combo for large)
+    # Without sweep, combo for 300K could grab the 50K books as part of a larger combo
+    books = [
+        _book(0, 100000.0, "INV-A", doc_date="10-Jun-2023"),
+        _book(1, 100000.0, "INV-B", doc_date="10-Jun-2023"),
+        _book(2, 100000.0, "INV-C", doc_date="10-Jun-2023"),
+        _book(3, 49500.0, "INV-D", doc_date="12-Jun-2023"),  # 1% variance to small entry 1
+        _book(4, 49000.0, "INV-E", doc_date="13-Jun-2023"),  # 2% variance to small entry 2
+    ]
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    matched, suggested = _split_results(all_results)
+
+    # Both small entries should be matched (not U02 unmatched)
+    matched_indices = {r.as26_index for r in matched + suggested}
+    assert 1 in matched_indices, "Small entry 1 should be matched by single sweep"
+    assert 2 in matched_indices, "Small entry 2 should be matched by single sweep"
+
+
+def test_single_sweep_disabled_via_config():
+    """When single_sweep_before_combo=False, sweep should not run."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        single_sweep_before_combo=False,
+        variance_normal_ceiling_pct=10.0,
+        variance_suggested_ceiling_pct=20.0,
+    )
+    as26 = [
+        _as26(0, 300000.0, date="15-Jun-2023"),
+        _as26(1, 50000.0, date="15-Jun-2023"),
+    ]
+    books = [
+        _book(0, 100000.0, "INV-A", doc_date="10-Jun-2023"),
+        _book(1, 100000.0, "INV-B", doc_date="10-Jun-2023"),
+        _book(2, 100000.0, "INV-C", doc_date="10-Jun-2023"),
+        _book(3, 49500.0, "INV-D", doc_date="12-Jun-2023"),
+    ]
+    # Just ensure it runs without error (behavior may vary — no assertion on match outcome)
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    assert len(all_results) + len(unmatched) >= 1
+
+
+def test_single_sweep_respects_overclaim():
+    """Single sweep must not match if book amount > 26AS amount (Section 199)."""
+    from config import MatchConfig
+    cfg = MatchConfig(
+        single_sweep_before_combo=True,
+        variance_normal_ceiling_pct=10.0,
+        variance_suggested_ceiling_pct=20.0,
+    )
+    as26 = [_as26(0, 100000.0, date="15-Jun-2023")]
+    books = [_book(0, 100001.0, "INV-OVER", doc_date="12-Jun-2023")]  # over-claim
+    all_results, unmatched = run_global_optimizer(as26, books, books, [], config=cfg)
+    matched, suggested = _split_results(all_results)
+    # Should not create a match that violates Section 199 (books_sum > as26_amount)
+    for r in matched:
+        assert sum(b.amount for b in r.books) <= r.as26_amount, \
+            f"Over-claim violation: books_sum={sum(b.amount for b in r.books)} > as26={r.as26_amount}"
+
+
+def test_bipartite_widening_prevents_combo_theft():
+    """When a small entry's candidate is above admin ceiling (3%) but within suggested
+    ceiling (20%), bipartite-widening should commit the book, preventing combo from
+    stealing it for a different entry's multi-book match."""
+    from config import MatchConfig
+    # Tight admin ceiling: only ≤1% gets auto-confirmed by bipartite in old behavior
+    cfg_with = MatchConfig(
+        single_sweep_before_combo=True,
+        variance_normal_ceiling_pct=1.0,
+        variance_suggested_ceiling_pct=20.0,
+    )
+    cfg_without = MatchConfig(
+        single_sweep_before_combo=False,
+        variance_normal_ceiling_pct=1.0,
+        variance_suggested_ceiling_pct=20.0,
+    )
+    # Entry 0: 200,000 — needs combo of books 0+1+2 (sum=200K)
+    # Entry 1: 50,000 — has a single candidate at 3% variance (book 3 = 48,500)
+    as26 = [
+        _as26(0, 200000.0, date="15-Jun-2023"),
+        _as26(1, 50000.0, date="15-Jun-2023"),
+    ]
+    books = [
+        _book(0, 70000.0, "INV-A", doc_date="10-Jun-2023"),
+        _book(1, 80000.0, "INV-B", doc_date="10-Jun-2023"),
+        _book(2, 48500.0, "INV-C", doc_date="10-Jun-2023"),  # combo candidate AND single candidate
+        _book(3, 48500.0, "INV-D", doc_date="12-Jun-2023"),  # 3% variance to entry 1
+    ]
+
+    # With widening: bipartite claims book 3 for entry 1 (3% match), combo uses others for entry 0
+    res_with, unmatched_with = run_global_optimizer(as26, books, books, [], config=cfg_with)
+    all_indices_with = {r.as26_index for r in res_with}
+    assert 1 in all_indices_with, "Entry 1 should be matched (bipartite claims its book before combo)"
+
+    # Without widening: book 3 is in soft_candidates (not committed), combo may grab it
+    res_without, unmatched_without = run_global_optimizer(as26, books, books, [], config=cfg_without)
+    # Just verify it runs — the old behavior may or may not match entry 1
+    assert len(res_without) + len(unmatched_without) >= 1

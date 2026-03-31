@@ -51,6 +51,12 @@ export default function DashboardPage() {
     refetchInterval: 15_000,
   });
 
+  const { data: trendData } = useQuery({
+    queryKey: ['variance-trends'],
+    queryFn: () => runsApi.trends({ limit: 50 }),
+    staleTime: 60_000,
+  });
+
   const stats = useMemo(() => {
     const total = runs.length;
     const pending = runs.filter((r) => r.status === 'PENDING_REVIEW').length;
@@ -264,7 +270,24 @@ export default function DashboardPage() {
         <div className="space-y-4">
           {/* Match rate trend chart */}
           <Card>
-            <CardHeader title="Match Rate Trend" subtitle="Last 10 completed runs" />
+            <div className="flex items-start justify-between mb-3">
+              <CardHeader title="Match Rate Trend" subtitle="Last 10 completed runs" />
+              {trendData && trendData.avg_match_rate != null && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                    trendData.trend_direction === 'improving' ? 'bg-emerald-100 text-emerald-700' :
+                    trendData.trend_direction === 'declining' ? 'bg-red-100 text-red-700' :
+                    'bg-gray-100 text-gray-600'
+                  }`}>
+                    {trendData.trend_direction === 'improving' ? 'Improving' :
+                     trendData.trend_direction === 'declining' ? 'Declining' : 'Stable'}
+                  </span>
+                  <span className="text-[10px] text-gray-400">
+                    Avg {trendData.avg_match_rate}% | Range {trendData.min_match_rate}–{trendData.max_match_rate}%
+                  </span>
+                </div>
+              )}
+            </div>
             {chartData.length >= 2 ? (
               <ResponsiveContainer width="100%" height={150}>
                 <AreaChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: -20 }}>

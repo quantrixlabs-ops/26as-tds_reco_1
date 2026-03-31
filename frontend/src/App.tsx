@@ -30,6 +30,7 @@ const NewRunPage = lazy(() => import('./pages/NewRunPage'));
 const RunDetailPage = lazy(() => import('./pages/RunDetailPage'));
 const RunHistoryPage = lazy(() => import('./pages/RunHistoryPage'));
 const AdminPage = lazy(() => import('./pages/AdminPage'));
+const DocsPage = lazy(() => import('./pages/DocsPage'));
 
 // ── React Query client ────────────────────────────────────────────────────────
 
@@ -180,6 +181,15 @@ function AppRoutes() {
         element={
           <PrivateRoute>
             <RunDetailPage />
+          </PrivateRoute>
+        }
+      />
+
+      <Route
+        path="/docs"
+        element={
+          <PrivateRoute>
+            <DocsPage />
           </PrivateRoute>
         }
       />

@@ -22,3 +22,15 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# SQLite databases (runtime generated, can be 1 GB+)
+*.db
+*.db-shm
+*.db-wal
+
+# Runtime generated
+backend/audit_logs/
+backend/benchmark_results.json
+screenshots/
+.claude/
+package-lock.json

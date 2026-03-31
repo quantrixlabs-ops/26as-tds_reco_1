@@ -797,6 +797,14 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Duplicate detection warnings
+  const [duplicateWarnings, setDuplicateWarnings] = useState<
+    Array<{
+      sap_filename: string;
+      prior_runs: Array<{ run_number: number; deductor_name: string | null; financial_year: string; created_at: string | null }>;
+    }>
+  >([]);
+
   // Chunked batch progress
   const [batchProgress, setBatchProgress] = useState<{
     current: number;
@@ -832,6 +840,18 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
         }
       }
       setOverrides(seed);
+      // Check for duplicate SAP files (non-blocking)
+      try {
+        const dupResult = await runsApi.checkDuplicates(sapFiles);
+        if (dupResult.enabled && dupResult.duplicates.length > 0) {
+          setDuplicateWarnings(dupResult.duplicates);
+        } else {
+          setDuplicateWarnings([]);
+        }
+      } catch {
+        // Silent — duplicate check is informational only
+        setDuplicateWarnings([]);
+      }
       setStep('config');
     } catch (err) {
       const msg = getErrorMessage(err);
@@ -1020,6 +1040,34 @@ function BatchUploadForm({ fyOptions, fyDefault }: { fyOptions: string[]; fyDefa
         <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-700">
           <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
           <span>{error}</span>
+        </div>
+      )}
+
+      {duplicateWarnings.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3">
+          <div className="flex items-center gap-2 text-sm font-semibold text-amber-800 mb-2">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            Duplicate Files Detected
+          </div>
+          <div className="space-y-1.5">
+            {duplicateWarnings.map((w) => (
+              <div key={w.sap_filename} className="text-xs text-amber-700">
+                <span className="font-medium font-mono">{w.sap_filename}</span>
+                {' — previously processed in '}
+                {w.prior_runs.slice(0, 2).map((r, i) => (
+                  <span key={r.run_number}>
+                    {i > 0 && ', '}
+                    <span className="font-semibold">RUN-{String(r.run_number).padStart(4, '0')}</span>
+                    {r.deductor_name && ` (${r.deductor_name})`}
+                  </span>
+                ))}
+                {w.prior_runs.length > 2 && ` +${w.prior_runs.length - 2} more`}
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-amber-600 mt-2">
+            These files have been reconciled before. Proceeding will create new runs.
+          </p>
         </div>
       )}
 

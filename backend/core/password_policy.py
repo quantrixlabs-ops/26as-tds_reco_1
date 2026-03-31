@@ -41,22 +41,31 @@ class PasswordValidationResult:
     strength_label: str    # Human-readable label
 
 
-def validate_password(password: str) -> PasswordValidationResult:
+def validate_password(
+    password: str,
+    min_length: int | None = None,
+    require_mixed_case: bool | None = None,
+    require_number: bool | None = None,
+) -> PasswordValidationResult:
     """
     Validate password against policy rules.
-    Returns validation result with errors and strength score.
+    Phase 7B: accepts optional overrides from AdminSettings.
+    Falls back to module-level constants when not provided.
     """
+    eff_min = min_length if min_length is not None else MIN_LENGTH
+    eff_mixed = require_mixed_case if require_mixed_case is not None else True
+    eff_number = require_number if require_number is not None else True
     errors: List[str] = []
 
-    if len(password) < MIN_LENGTH:
-        errors.append(f"Must be at least {MIN_LENGTH} characters")
+    if len(password) < eff_min:
+        errors.append(f"Must be at least {eff_min} characters")
     if len(password) > MAX_LENGTH:
         errors.append(f"Must be at most {MAX_LENGTH} characters")
-    if not HAS_UPPER.search(password):
+    if eff_mixed and not HAS_UPPER.search(password):
         errors.append("Must include at least one uppercase letter")
-    if not HAS_LOWER.search(password):
+    if eff_mixed and not HAS_LOWER.search(password):
         errors.append("Must include at least one lowercase letter")
-    if not HAS_DIGIT.search(password):
+    if eff_number and not HAS_DIGIT.search(password):
         errors.append("Must include at least one digit")
     if not HAS_SPECIAL.search(password):
         errors.append("Must include at least one special character (!@#$%^&*...)")

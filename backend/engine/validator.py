@@ -162,15 +162,28 @@ class ValidationReport:
 
 # ── Validator ─────────────────────────────────────────────────────────────────
 
-def validate_26as(df: pd.DataFrame) -> Tuple[pd.DataFrame, ValidationReport]:
+def validate_26as(
+    df: pd.DataFrame,
+    rate_tolerance_pct: Optional[float] = None,
+    rate_mismatch_severity: Optional[str] = None,
+) -> Tuple[pd.DataFrame, ValidationReport]:
     """
     Run all validators on the parsed 26AS DataFrame.
+
+    Args:
+        df: Parsed 26AS DataFrame
+        rate_tolerance_pct: Phase 5G — override default 2% rate tolerance
+        rate_mismatch_severity: Phase 5G — override default MEDIUM severity for rate mismatches
 
     Returns:
         (validated_df, report)
         validated_df: rows that pass validation (flagged rows are KEPT but marked)
         report: full ValidationReport with all issues
     """
+    # Phase 5G: resolve configurable rate tolerance
+    eff_rate_tol = rate_tolerance_pct if rate_tolerance_pct is not None else RATE_TOLERANCE_PCT
+    eff_rate_sev = rate_mismatch_severity if rate_mismatch_severity is not None else "MEDIUM"
+
     report = ValidationReport(total_rows=len(df))
     if df.empty:
         return df, report
@@ -223,7 +236,7 @@ def validate_26as(df: pd.DataFrame) -> Tuple[pd.DataFrame, ValidationReport]:
 
             if amount > 0:
                 rate_divergence_pct = abs(derived_gross - float(amount)) / float(amount) * 100
-                if rate_divergence_pct > RATE_TOLERANCE_PCT:
+                if rate_divergence_pct > eff_rate_tol:
                     df.at[idx, "_rate_mismatch"] = True
                     report.rate_mismatches += 1
 
@@ -240,7 +253,7 @@ def validate_26as(df: pd.DataFrame) -> Tuple[pd.DataFrame, ValidationReport]:
                             df.at[idx, "_flags"] = _add_flag(df.at[idx, "_flags"], "POSSIBLE_206AA")
                         else:
                             row_issues.append(ValidationIssue(
-                                code="RATE_MISMATCH", severity="MEDIUM", row_index=idx,
+                                code="RATE_MISMATCH", severity=eff_rate_sev, row_index=idx,
                                 description=(
                                     f"Section {section}: expected rate {expected_rate}%, "
                                     f"derived gross ₹{derived_gross:,.2f} vs reported ₹{amount:,.2f} "

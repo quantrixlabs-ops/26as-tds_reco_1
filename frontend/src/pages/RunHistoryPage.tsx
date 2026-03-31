@@ -4,7 +4,7 @@
  */
 import { useMemo, useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Search,
   SlidersHorizontal,
@@ -13,14 +13,23 @@ import {
   Layers,
   ChevronDown,
   ChevronUp,
+  ChevronsUpDown,
   CheckCircle,
   XCircle,
   AlertTriangle,
   Loader2,
   Download,
   Trash2,
+  Pencil,
+  Check,
+  X,
+  Plus,
+  Tag,
+  BarChart3,
+  Clock,
 } from 'lucide-react';
-import { runsApi, type RunSummary, type RunStatus } from '../lib/api';
+import { runsApi, settingsApi, type RunSummary, type RunStatus } from '../lib/api';
+import { useAuth } from '../lib/auth';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Table, type Column } from '../components/ui/Table';
@@ -61,6 +70,8 @@ interface BatchGroup {
   runs: RunSummary[];
   financial_year: string;
   created_at: string;
+  batch_name: string | null;
+  batch_tags: string[] | null;
   total_parties: number;
   completed: number;
   failed: number;
@@ -96,6 +107,8 @@ function buildBatchGroups(runs: RunSummary[]): BatchGroup[] {
       runs: sorted,
       financial_year: sorted[0].financial_year,
       created_at: sorted[0].created_at,
+      batch_name: sorted[0].batch_name ?? null,
+      batch_tags: sorted[0].batch_tags ?? null,
       total_parties: sorted.length,
       completed,
       failed,
@@ -124,20 +137,362 @@ function statusIcon(status: string) {
   return <CheckCircle className="h-3.5 w-3.5 text-gray-400" />;
 }
 
+// ── Batch Comparison Panel ────────────────────────────────────────────────────
+
+function BatchComparisonPanel({ batchId }: { batchId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['batch-compare', batchId],
+    queryFn: () => runsApi.batchCompare(batchId),
+    staleTime: 60_000,
+  });
+
+  if (isLoading) return (
+    <div className="flex items-center justify-center py-4">
+      <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+      <span className="text-xs text-gray-400 ml-2">Loading comparison...</span>
+    </div>
+  );
+  if (!data || !data.has_parent) return (
+    <div className="px-5 py-4 text-xs text-gray-500">
+      No parent batch found — comparison requires a rerun batch.
+    </div>
+  );
+
+  const fmtDelta = (v: number, suffix = '') => {
+    if (v === 0) return <span className="text-gray-400">0{suffix}</span>;
+    const color = v > 0 ? 'text-emerald-600' : 'text-red-600';
+    return <span className={cn('font-semibold', color)}>{v > 0 ? '+' : ''}{v}{suffix}</span>;
+  };
+
+  return (
+    <div className="px-5 py-4">
+      <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">
+        Rerun vs Original — Per-Party Delta
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-gray-200 text-gray-500 text-left">
+              <th className="py-1.5 pr-3 font-semibold">Party</th>
+              <th className="py-1.5 px-2 text-center font-semibold">Match Rate</th>
+              <th className="py-1.5 px-2 text-center font-semibold">Matched</th>
+              <th className="py-1.5 px-2 text-center font-semibold">Suggested</th>
+              <th className="py-1.5 px-2 text-center font-semibold">Unmatched</th>
+              <th className="py-1.5 px-2 text-center font-semibold">Violations</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {data.parties.map((p) => (
+              <tr key={p.current.run_id}>
+                <td className="py-1.5 pr-3 text-gray-700 font-medium truncate max-w-[200px]">
+                  {p.current.deductor_name || `RUN-${String(p.current.run_number).padStart(4, '0')}`}
+                </td>
+                <td className="py-1.5 px-2 text-center">
+                  {p.delta ? fmtDelta(p.delta.match_rate_pct, '%') : '—'}
+                </td>
+                <td className="py-1.5 px-2 text-center">
+                  {p.delta ? fmtDelta(p.delta.matched_count) : '—'}
+                </td>
+                <td className="py-1.5 px-2 text-center">
+                  {p.delta ? fmtDelta(p.delta.suggested_count) : '—'}
+                </td>
+                <td className="py-1.5 px-2 text-center">
+                  {p.delta ? fmtDelta(-p.delta.unmatched_26as_count) : '—'}
+                </td>
+                <td className="py-1.5 px-2 text-center">
+                  {p.delta ? fmtDelta(-p.delta.constraint_violations) : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+// ── Batch Progress Panel ─────────────────────────────────────────────────────
+
+function BatchProgressPanel({ batchId }: { batchId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['batch-progress', batchId],
+    queryFn: () => runsApi.batchProgress(batchId),
+    refetchInterval: (query) => {
+      // Stop polling once batch is complete
+      return query.state.data?.is_complete ? false : 2000;
+    },
+  });
+
+  if (isLoading) return (
+    <div className="flex items-center justify-center py-4">
+      <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+      <span className="text-xs text-gray-400 ml-2">Loading progress...</span>
+    </div>
+  );
+  if (!data) return null;
+
+  const { overall_pct, total_runs, completed, failed, processing, runs } = data;
+
+  return (
+    <div className="px-5 py-4 space-y-3">
+      {/* Overall progress bar */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <p className="text-xs font-semibold text-gray-700">
+            Batch Progress — {completed + failed}/{total_runs} parties done
+          </p>
+          <span className="text-xs font-bold text-[#1B3A5C]">{overall_pct.toFixed(0)}%</span>
+        </div>
+        <div className="h-3 bg-gray-100 rounded-full overflow-hidden">
+          <div
+            className={cn(
+              'h-full rounded-full transition-all duration-500',
+              failed > 0 && processing === 0 ? 'bg-amber-500' : 'bg-[#1B3A5C]',
+            )}
+            style={{ width: `${overall_pct}%` }}
+          />
+        </div>
+        <div className="flex items-center gap-4 mt-1.5 text-[10px] text-gray-500">
+          {processing > 0 && <span className="flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin text-blue-500" />{processing} processing</span>}
+          {completed > 0 && <span className="text-emerald-600 font-medium">{completed} completed</span>}
+          {failed > 0 && <span className="text-red-600 font-medium">{failed} failed</span>}
+        </div>
+      </div>
+
+      {/* Per-run progress rows */}
+      <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
+        {runs.map((r) => (
+          <div key={r.run_id} className="flex items-center gap-3">
+            <div className="w-36 truncate text-xs text-gray-600 font-medium">
+              {r.deductor_name || r.sap_filename}
+            </div>
+            <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all duration-300',
+                  r.status === 'FAILED' ? 'bg-red-400' :
+                  r.status === 'PROCESSING' ? 'bg-blue-500' :
+                  'bg-emerald-500',
+                )}
+                style={{ width: `${r.progress_pct}%` }}
+              />
+            </div>
+            <span className="w-12 text-right text-[10px] font-semibold text-gray-500">
+              {r.status === 'FAILED' ? 'FAIL' : `${r.progress_pct.toFixed(0)}%`}
+            </span>
+            <span className="w-16 text-right text-[10px] text-gray-400">
+              {r.stage}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Batch Analytics Panel ────────────────────────────────────────────────────
+
+function BatchAnalyticsPanel({ batchId }: { batchId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['batch-analytics', batchId],
+    queryFn: () => runsApi.batchAnalytics(batchId),
+    staleTime: 30_000,
+  });
+
+  if (isLoading) return (
+    <div className="flex items-center justify-center py-6">
+      <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+      <span className="text-xs text-gray-400 ml-2">Loading analytics...</span>
+    </div>
+  );
+  if (!data) return null;
+
+  const { confidence_distribution: conf, match_type_breakdown: mt, financial_waterfall: fw, risk_matrix: risk } = data;
+  const confTotal = Object.values(conf).reduce((s, v) => s + v, 0) || 1;
+  const fmtAmt = (n: number) => n >= 10_000_000 ? `${(n / 10_000_000).toFixed(2)} Cr` : n >= 100_000 ? `${(n / 100_000).toFixed(2)} L` : n.toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+  return (
+    <div className="px-5 py-4 space-y-4">
+      {/* Row 1: Confidence + Match Types + Financial Waterfall */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* Confidence Distribution */}
+        <div className="bg-white border border-gray-100 rounded-lg p-3">
+          <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">Confidence Distribution</p>
+          <div className="space-y-2">
+            {(['HIGH', 'MEDIUM', 'LOW'] as const).map((tier) => {
+              const count = conf[tier] || 0;
+              const pct = (count / confTotal * 100);
+              const color = tier === 'HIGH' ? 'bg-emerald-500' : tier === 'MEDIUM' ? 'bg-amber-500' : 'bg-orange-500';
+              return (
+                <div key={tier}>
+                  <div className="flex items-center justify-between text-xs mb-0.5">
+                    <span className="text-gray-600">{tier}</span>
+                    <span className="font-semibold text-gray-900">{count} ({pct.toFixed(0)}%)</span>
+                  </div>
+                  <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                    <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Match Type Breakdown */}
+        <div className="bg-white border border-gray-100 rounded-lg p-3">
+          <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">Match Type Breakdown</p>
+          <div className="space-y-1.5 max-h-[120px] overflow-y-auto">
+            {Object.entries(mt).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
+              <div key={type} className="flex items-center justify-between text-xs">
+                <span className="text-gray-600 font-mono truncate mr-2">{type}</span>
+                <span className="font-semibold text-gray-900 shrink-0">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Financial Waterfall */}
+        <div className="bg-white border border-gray-100 rounded-lg p-3">
+          <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">Financial Summary</p>
+          <div className="space-y-2">
+            {[
+              { label: 'Total 26AS', value: fw.total_26as, color: 'text-gray-900' },
+              { label: 'Matched', value: fw.matched, color: 'text-emerald-600' },
+              { label: 'Suggested', value: fw.suggested, color: 'text-amber-600' },
+              { label: 'Unmatched', value: fw.unmatched, color: 'text-red-600' },
+            ].map((row) => (
+              <div key={row.label} className="flex items-center justify-between text-xs">
+                <span className="text-gray-600">{row.label}</span>
+                <span className={cn('font-semibold font-mono', row.color)}>{fmtAmt(row.value)}</span>
+              </div>
+            ))}
+            {fw.total_26as > 0 && (
+              <div className="h-3 bg-gray-100 rounded-full overflow-hidden flex">
+                <div className="bg-emerald-500 h-full" style={{ width: `${(fw.matched / fw.total_26as) * 100}%` }} />
+                <div className="bg-amber-400 h-full" style={{ width: `${(fw.suggested / fw.total_26as) * 100}%` }} />
+                <div className="bg-red-400 h-full" style={{ width: `${(fw.unmatched / fw.total_26as) * 100}%` }} />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Row 2: Risk Matrix (top 5 riskiest parties) */}
+      {risk.length > 0 && (
+        <div className="bg-white border border-gray-100 rounded-lg p-3">
+          <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">Risk Matrix (by risk score)</p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-gray-500 border-b border-gray-100">
+                  <th className="text-left py-1 pr-3">Party</th>
+                  <th className="text-center py-1 px-2">Match%</th>
+                  <th className="text-center py-1 px-2">Violations</th>
+                  <th className="text-center py-1 px-2">Low Conf.</th>
+                  <th className="text-center py-1 px-2">Unmatched Amt</th>
+                  <th className="text-center py-1 px-2">Risk Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {risk.slice(0, 5).map((r) => (
+                  <tr key={r.run_id} className="border-t border-gray-50">
+                    <td className="py-1.5 pr-3 font-medium text-gray-900 truncate max-w-[160px]">{r.deductor_name}</td>
+                    <td className={cn('py-1.5 px-2 text-center font-semibold', matchRateColor(r.match_rate_pct))}>{formatPct(r.match_rate_pct)}</td>
+                    <td className={cn('py-1.5 px-2 text-center font-semibold', r.violations > 0 ? 'text-red-600' : 'text-emerald-600')}>{r.violations}</td>
+                    <td className={cn('py-1.5 px-2 text-center', r.low_confidence_count > 0 ? 'text-orange-600 font-semibold' : 'text-gray-400')}>{r.low_confidence_count}</td>
+                    <td className={cn('py-1.5 px-2 text-center font-mono', r.unmatched_amount > 0 ? 'text-red-600' : 'text-gray-400')}>{fmtAmt(r.unmatched_amount)}</td>
+                    <td className="py-1.5 px-2 text-center">
+                      <span className={cn(
+                        'inline-flex items-center px-1.5 py-0.5 rounded font-bold text-[10px]',
+                        r.risk_score >= 30 ? 'bg-red-100 text-red-700'
+                          : r.risk_score >= 15 ? 'bg-amber-100 text-amber-700'
+                          : 'bg-emerald-100 text-emerald-700',
+                      )}>
+                        {r.risk_score}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Batch group card ────────────────────────────────────────────────────────
+
+type BatchSortKey = 'run_number' | 'deductor_name' | 'match_rate_pct' | 'matched_count' | 'unmatched_26as_count' | 'constraint_violations' | 'status';
 
 function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; onRunClick: (id: string) => void; onRefresh: () => void }) {
   const { toast } = useToast();
   const [expanded, setExpanded] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [authorizing, setAuthorizing] = useState(false);
-  const [authResult, setAuthResult] = useState<{ success_count: number; skipped_requires_remarks: number } | null>(null);
+  const [authResult, setAuthResult] = useState<{ success_count: number; skipped_requires_remarks: number; skipped_invoice_reuse: number } | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authRemarks, setAuthRemarks] = useState('');
   const [rerunning, setRerunning] = useState(false);
   const [showRerunConfirm, setShowRerunConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showAnalytics, setShowAnalytics] = useState(false);
+  const [showComparison, setShowComparison] = useState(false);
+  const hasParent = group.runs.some((r) => r.parent_batch_id);
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [scheduleDate, setScheduleDate] = useState('');
+  const [scheduling, setScheduling] = useState(false);
+
+  // Batch naming & tagging state
+  const [editingName, setEditingName] = useState(false);
+  const [nameValue, setNameValue] = useState(group.batch_name || '');
+  const [editingTags, setEditingTags] = useState(false);
+  const [tagsValue, setTagsValue] = useState<string[]>(group.batch_tags || []);
+  const [tagInput, setTagInput] = useState('');
+  const [savingMeta, setSavingMeta] = useState(false);
+
+  const saveBatchMeta = async (data: { batch_name?: string; batch_tags?: string[] }) => {
+    setSavingMeta(true);
+    try {
+      await runsApi.batchUpdateMetadata(group.batch_id, data);
+      onRefresh();
+      toast('Batch updated', 'Metadata saved successfully', 'success');
+    } catch (err: any) {
+      toast('Save failed', err?.response?.data?.detail || 'Failed to update batch metadata', 'error');
+    } finally {
+      setSavingMeta(false);
+    }
+  };
+
+  // Sort state for per-party table
+  const [batchSortKey, setBatchSortKey] = useState<BatchSortKey>('run_number');
+  const [batchSortDir, setBatchSortDir] = useState<'asc' | 'desc'>('asc');
+
+  const handleBatchSort = (key: BatchSortKey) => {
+    if (batchSortKey === key) setBatchSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setBatchSortKey(key); setBatchSortDir(key === 'run_number' || key === 'deductor_name' ? 'asc' : 'desc'); }
+  };
+
+  const STATUS_RANK: Record<string, number> = { PROCESSING: 0, FAILED: 1, PENDING_REVIEW: 2, APPROVED: 3, REJECTED: 4 };
+
+  const sortedRuns = [...group.runs].sort((a, b) => {
+    let cmp = 0;
+    switch (batchSortKey) {
+      case 'run_number': cmp = a.run_number - b.run_number; break;
+      case 'deductor_name': cmp = (a.deductor_name || '').localeCompare(b.deductor_name || ''); break;
+      case 'match_rate_pct': cmp = a.match_rate_pct - b.match_rate_pct; break;
+      case 'matched_count': cmp = a.matched_count - b.matched_count; break;
+      case 'unmatched_26as_count': cmp = a.unmatched_26as_count - b.unmatched_26as_count; break;
+      case 'constraint_violations': cmp = a.constraint_violations - b.constraint_violations; break;
+      case 'status': cmp = (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9); break;
+    }
+    return batchSortDir === 'desc' ? -cmp : cmp;
+  });
 
   const hasCompletedRuns = group.completed > 0;
   const allDone = group.processing === 0;
@@ -165,14 +520,37 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm font-semibold text-gray-900">
-              {group.total_parties} Parties
-            </span>
+            {group.batch_name ? (
+              <span className="text-sm font-semibold text-gray-900 truncate max-w-[240px]" title={group.batch_name}>
+                {group.batch_name}
+              </span>
+            ) : (
+              <span className="text-sm font-semibold text-gray-900">
+                {group.total_parties} Parties
+              </span>
+            )}
             <span className="text-xs text-gray-400">·</span>
             <span className="text-xs font-medium text-gray-600">{formatFY(group.financial_year)}</span>
             <span className="text-xs text-gray-400">·</span>
             <span className="text-xs text-gray-400">{formatDateTime(group.created_at)}</span>
+            {group.batch_name && (
+              <>
+                <span className="text-xs text-gray-400">·</span>
+                <span className="text-xs text-gray-500">{group.total_parties} parties</span>
+              </>
+            )}
           </div>
+          {/* Tags row */}
+          {group.batch_tags && group.batch_tags.length > 0 && (
+            <div className="flex items-center gap-1 mt-1 flex-wrap">
+              <Tag className="h-3 w-3 text-gray-400 shrink-0" />
+              {group.batch_tags.map((tag) => (
+                <span key={tag} className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium bg-[#1B3A5C]/10 text-[#1B3A5C] rounded">
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
           <p className="text-xs text-gray-500 mt-0.5 truncate">
             {group.runs.slice(0, 3).map((r) => r.deductor_name || '—').join(', ')}
             {group.runs.length > 3 && ` +${group.runs.length - 3} more`}
@@ -251,6 +629,40 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
             {/* Batch actions */}
             {hasCompletedRuns && (
               <div className="col-span-2 sm:col-span-4 flex items-center justify-end gap-3">
+                {/* Comparison Toggle (only for rerun batches) */}
+                {hasParent && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowComparison(!showComparison);
+                    }}
+                    className={cn(
+                      'flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg transition-colors',
+                      showComparison
+                        ? 'bg-amber-600 text-white'
+                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+                    )}
+                  >
+                    <ChevronsUpDown className="h-4 w-4" />
+                    Compare
+                  </button>
+                )}
+                {/* Analytics Toggle */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowAnalytics(!showAnalytics);
+                  }}
+                  className={cn(
+                    'flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg transition-colors',
+                    showAnalytics
+                      ? 'bg-[#1B3A5C] text-white'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+                  )}
+                >
+                  <BarChart3 className="h-4 w-4" />
+                  Analytics
+                </button>
                 {/* Rerun Batch */}
                 <button
                   onClick={(e) => {
@@ -276,7 +688,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                     try {
                       const res = await runsApi.batchRerun(group.batch_id);
                       onRefresh();
-                      toast('Batch rerun started', `${res.total} runs processing. New batch created.`, 'success');
+                      toast('Batch rerun started', `${res.total} runs re-processing with current settings.`, 'success');
                     } catch (err: any) {
                       const msg = err?.response?.data?.detail || 'Rerun failed';
                       toast('Rerun failed', msg, 'error');
@@ -287,14 +699,30 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                   title={`Rerun batch (${group.total_parties} parties)?`}
                   description={
                     group.runs.some((r) => r.status === 'APPROVED')
-                      ? 'This batch contains APPROVED runs. Rerunning will create a new batch with fresh (unapproved) results. The original approved runs will NOT be affected.'
-                      : 'A new batch will be created with fresh reconciliation results. The original batch will not be modified.'
+                      ? 'This batch contains APPROVED runs. Rerunning will clear existing results and re-process all runs with current settings. Approved status will be reset.'
+                      : 'All runs in this batch will be re-processed with current settings. Existing results will be replaced.'
                   }
                   confirmLabel="Rerun batch"
                   variant="info"
                   loading={rerunning}
                   icon={<RefreshCw className="h-5 w-5 text-[#1B3A5C]" />}
                 />
+                {/* Schedule Rerun */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowSchedule(!showSchedule);
+                  }}
+                  className={cn(
+                    'flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg transition-colors',
+                    showSchedule
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+                  )}
+                >
+                  <Clock className="h-4 w-4" />
+                  Schedule
+                </button>
                 {/* Authorize All Suggested */}
                 <button
                   onClick={(e) => {
@@ -386,6 +814,9 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                   <CheckCircle className="h-4 w-4 shrink-0" />
                   <span>
                     {authResult.success_count} suggested match{authResult.success_count !== 1 ? 'es' : ''} authorized and promoted.
+                    {authResult.skipped_invoice_reuse > 0 && (
+                      <> ({authResult.skipped_invoice_reuse} with shared invoice refs — flagged for audit review).</>
+                    )}
                     {authResult.skipped_requires_remarks > 0 && (
                       <> {authResult.skipped_requires_remarks} skipped (require individual review with remarks).</>
                     )}
@@ -430,7 +861,7 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
                             group.batch_id,
                             authRemarks.trim() || undefined,
                           );
-                          setAuthResult({ success_count: res.success_count, skipped_requires_remarks: res.skipped_requires_remarks });
+                          setAuthResult({ success_count: res.success_count, skipped_requires_remarks: res.skipped_requires_remarks, skipped_invoice_reuse: res.skipped_invoice_reuse || 0 });
                           onRefresh();
                         } catch (err) {
                           console.error('Batch authorize failed:', err);
@@ -450,25 +881,285 @@ function BatchGroupCard({ group, onRunClick, onRefresh }: { group: BatchGroup; o
             )}
           </div>
 
+          {/* Batch naming & tagging */}
+          <div className="px-5 py-3 border-t border-gray-100 bg-white">
+            <div className="flex items-start gap-6 flex-wrap">
+              {/* Batch Name */}
+              <div className="flex-1 min-w-[200px]">
+                <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-1">Batch Name</p>
+                {editingName ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={nameValue}
+                      onChange={(e) => setNameValue(e.target.value)}
+                      placeholder="e.g. Q4 FY23 Final Reco"
+                      className="flex-1 text-sm border border-gray-300 rounded-lg px-3 py-1.5 outline-none focus:border-[#1B3A5C] focus:ring-2 focus:ring-[#1B3A5C]/10"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          setEditingName(false);
+                          saveBatchMeta({ batch_name: nameValue.trim() || undefined });
+                        }
+                        if (e.key === 'Escape') {
+                          setEditingName(false);
+                          setNameValue(group.batch_name || '');
+                        }
+                      }}
+                    />
+                    <button
+                      onClick={() => {
+                        setEditingName(false);
+                        saveBatchMeta({ batch_name: nameValue.trim() || undefined });
+                      }}
+                      disabled={savingMeta}
+                      className="p-1 text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                    >
+                      <Check className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEditingName(false);
+                        setNameValue(group.batch_name || '');
+                      }}
+                      className="p-1 text-gray-400 hover:bg-gray-100 rounded transition-colors"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-700">
+                      {group.batch_name || <span className="text-gray-400 italic">No name set</span>}
+                    </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setNameValue(group.batch_name || '');
+                        setEditingName(true);
+                      }}
+                      className="p-1 text-gray-400 hover:text-[#1B3A5C] hover:bg-[#1B3A5C]/5 rounded transition-colors"
+                      title="Edit batch name"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Batch Tags */}
+              <div className="flex-1 min-w-[200px]">
+                <p className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-1">Tags</p>
+                {editingTags ? (
+                  <div>
+                    <div className="flex items-center gap-1 flex-wrap mb-1.5">
+                      {tagsValue.map((tag) => (
+                        <span
+                          key={tag}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-[#1B3A5C]/10 text-[#1B3A5C] rounded"
+                        >
+                          {tag}
+                          <button
+                            onClick={() => setTagsValue(tagsValue.filter((t) => t !== tag))}
+                            className="hover:text-red-600 transition-colors"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={tagInput}
+                        onChange={(e) => setTagInput(e.target.value)}
+                        placeholder="Add tag..."
+                        className="flex-1 text-sm border border-gray-300 rounded-lg px-3 py-1.5 outline-none focus:border-[#1B3A5C] focus:ring-2 focus:ring-[#1B3A5C]/10"
+                        onKeyDown={(e) => {
+                          if ((e.key === 'Enter' || e.key === ',') && tagInput.trim()) {
+                            e.preventDefault();
+                            const val = tagInput.trim().toUpperCase();
+                            if (!tagsValue.includes(val)) setTagsValue([...tagsValue, val]);
+                            setTagInput('');
+                          }
+                          if (e.key === 'Escape') {
+                            setEditingTags(false);
+                            setTagsValue(group.batch_tags || []);
+                            setTagInput('');
+                          }
+                        }}
+                      />
+                      {tagInput.trim() && (
+                        <button
+                          onClick={() => {
+                            const val = tagInput.trim().toUpperCase();
+                            if (!tagsValue.includes(val)) setTagsValue([...tagsValue, val]);
+                            setTagInput('');
+                          }}
+                          className="p-1 text-[#1B3A5C] hover:bg-[#1B3A5C]/5 rounded transition-colors"
+                        >
+                          <Plus className="h-4 w-4" />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          setEditingTags(false);
+                          setTagInput('');
+                          saveBatchMeta({ batch_tags: tagsValue });
+                        }}
+                        disabled={savingMeta}
+                        className="p-1 text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                      >
+                        <Check className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={() => {
+                          setEditingTags(false);
+                          setTagsValue(group.batch_tags || []);
+                          setTagInput('');
+                        }}
+                        className="p-1 text-gray-400 hover:bg-gray-100 rounded transition-colors"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    {tagsValue.length > 0 ? (
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {tagsValue.map((tag) => (
+                          <span key={tag} className="inline-flex items-center px-2 py-0.5 text-xs font-medium bg-[#1B3A5C]/10 text-[#1B3A5C] rounded">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-sm text-gray-400 italic">No tags</span>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTagsValue(group.batch_tags || []);
+                        setEditingTags(true);
+                      }}
+                      className="p-1 text-gray-400 hover:text-[#1B3A5C] hover:bg-[#1B3A5C]/5 rounded transition-colors"
+                      title="Edit tags"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Batch progress panel — shown automatically when any run is processing */}
+          {group.processing > 0 && (
+            <div className="border-t border-gray-100 bg-blue-50/30">
+              <BatchProgressPanel batchId={group.batch_id} />
+            </div>
+          )}
+
+          {/* Analytics panel */}
+          {showAnalytics && (
+            <div className="border-t border-gray-100 bg-gray-50/30">
+              <BatchAnalyticsPanel batchId={group.batch_id} />
+            </div>
+          )}
+
+          {/* Comparison panel (rerun vs original) */}
+          {showComparison && hasParent && (
+            <div className="border-t border-gray-100 bg-amber-50/20">
+              <BatchComparisonPanel batchId={group.batch_id} />
+            </div>
+          )}
+
+          {/* Schedule rerun panel */}
+          {showSchedule && (
+            <div className="border-t border-gray-100 bg-purple-50/20 px-5 py-4">
+              <p className="text-xs font-semibold text-gray-700 mb-2">Schedule Batch Rerun</p>
+              <div className="flex items-end gap-3">
+                <div>
+                  <label className="block text-[10px] text-gray-500 mb-1">Date &amp; Time (UTC)</label>
+                  <input
+                    type="datetime-local"
+                    value={scheduleDate}
+                    onChange={(e) => setScheduleDate(e.target.value)}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/10"
+                  />
+                </div>
+                <button
+                  disabled={!scheduleDate || scheduling}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    setScheduling(true);
+                    try {
+                      const isoDate = new Date(scheduleDate).toISOString();
+                      await runsApi.batchSchedule(group.batch_id, isoDate);
+                      toast('Rerun scheduled', `Batch will rerun at ${new Date(scheduleDate).toLocaleString()}`, 'success');
+                      setShowSchedule(false);
+                      setScheduleDate('');
+                    } catch (err: any) {
+                      toast('Schedule failed', err?.response?.data?.detail || 'Failed to schedule', 'error');
+                    } finally {
+                      setScheduling(false);
+                    }
+                  }}
+                  className="flex items-center gap-2 px-4 py-1.5 bg-purple-600 text-white text-sm font-semibold rounded-lg hover:bg-purple-700 transition-colors disabled:opacity-50"
+                >
+                  {scheduling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Clock className="h-3.5 w-3.5" />}
+                  Schedule
+                </button>
+              </div>
+              <p className="text-[10px] text-gray-400 mt-2">
+                A new batch will be created from the original files at the scheduled time.
+              </p>
+            </div>
+          )}
+
           {/* Per-party table */}
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-[#1B3A5C] text-white text-xs uppercase tracking-wide">
-                  <th className="px-4 py-2.5 text-left">#</th>
-                  <th className="px-4 py-2.5 text-left">Deductor</th>
-                  <th className="px-4 py-2.5 text-center">TAN</th>
-                  <th className="px-4 py-2.5 text-center">Match Rate</th>
-                  <th className="px-4 py-2.5 text-center">Matched</th>
-                  <th className="px-4 py-2.5 text-center">Unmatched</th>
-                  <th className="px-4 py-2.5 text-center">Violations</th>
-                  <th className="px-4 py-2.5 text-center">Confidence</th>
-                  <th className="px-4 py-2.5 text-center">Status</th>
-                  <th className="px-4 py-2.5 text-center">Excel</th>
+                  {([
+                    { key: 'run_number' as BatchSortKey, label: '#', align: 'left' },
+                    { key: 'deductor_name' as BatchSortKey, label: 'Deductor', align: 'left' },
+                    { key: null, label: 'TAN', align: 'center' },
+                    { key: 'match_rate_pct' as BatchSortKey, label: 'Match Rate', align: 'center' },
+                    { key: 'matched_count' as BatchSortKey, label: 'Matched', align: 'center' },
+                    { key: 'unmatched_26as_count' as BatchSortKey, label: 'Unmatched', align: 'center' },
+                    { key: 'constraint_violations' as BatchSortKey, label: 'Violations', align: 'center' },
+                    { key: null, label: 'Confidence', align: 'center' },
+                    { key: 'status' as BatchSortKey, label: 'Status', align: 'center' },
+                    { key: null, label: 'Excel', align: 'center' },
+                  ] as const).map((col) => (
+                    <th
+                      key={col.label}
+                      className={cn(
+                        'px-4 py-2.5',
+                        col.align === 'center' ? 'text-center' : 'text-left',
+                        col.key && 'cursor-pointer select-none hover:bg-white/10 transition-colors',
+                      )}
+                      onClick={col.key ? () => handleBatchSort(col.key!) : undefined}
+                    >
+                      <span className="inline-flex items-center gap-0.5">
+                        {col.label}
+                        {col.key && (
+                          batchSortKey === col.key
+                            ? batchSortDir === 'asc'
+                              ? <ChevronUp className="h-3 w-3" />
+                              : <ChevronDown className="h-3 w-3" />
+                            : <ChevronsUpDown className="h-3 w-3 opacity-40" />
+                        )}
+                      </span>
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {group.runs.map((r, idx) => (
+                {sortedRuns.map((r, idx) => (
                   <tr
                     key={r.id}
                     onClick={() => onRunClick(r.id)}
@@ -570,6 +1261,9 @@ interface RunHistoryPageProps {
 export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { user } = useAuth();
+  const qc = useQueryClient();
+  const { toast } = useToast();
 
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<RunStatus | ''>(
@@ -630,8 +1324,68 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
   const singleCount = runs.filter((r) => r.mode !== 'BATCH').length;
   const batchGroupCount = buildBatchGroups(runs.filter((r) => r.mode === 'BATCH')).length;
 
+  // ── Bulk Operations (Phase 4D) ──
+  const { data: adminSettings } = useQuery({ queryKey: ['admin-settings'], queryFn: settingsApi.get });
+  const bulkEnabled = adminSettings?.bulk_operations_enabled ?? true;
+  const isReviewerOrAdmin = user?.role === 'REVIEWER' || user?.role === 'ADMIN';
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const selectAll = () => {
+    const pending = singleRuns.filter((r) => r.status === 'PENDING_REVIEW').map((r) => r.id);
+    setSelectedIds(new Set(pending));
+  };
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const bulkReviewMut = useMutation({
+    mutationFn: ({ action, notes }: { action: 'APPROVED' | 'REJECTED'; notes?: string }) =>
+      runsApi.bulkReview(Array.from(selectedIds), action, notes),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['runs'] });
+      clearSelection();
+      toast(`Bulk ${data.success > 0 ? 'success' : 'failed'}`,
+        `${data.success} succeeded, ${data.failed} failed`, data.success > 0 ? 'success' : 'error');
+    },
+    onError: (err) => toast('Bulk review failed', String(err), 'error'),
+  });
+
+  const bulkArchiveMut = useMutation({
+    mutationFn: () => runsApi.bulkArchive(Array.from(selectedIds)),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['runs'] });
+      clearSelection();
+      toast('Archived', `${data.archived} runs archived`, 'success');
+    },
+    onError: (err) => toast('Archive failed', String(err), 'error'),
+  });
+
   // Single run table columns
   const columns: Column<RunSummary>[] = [
+    ...(bulkEnabled && isReviewerOrAdmin ? [{
+      key: 'select' as keyof RunSummary,
+      header: (
+        <input type="checkbox"
+          checked={selectedIds.size > 0 && singleRuns.filter(r => r.status === 'PENDING_REVIEW').every(r => selectedIds.has(r.id))}
+          onChange={(e) => e.target.checked ? selectAll() : clearSelection()}
+          className="rounded border-gray-300"
+        />
+      ) as any,
+      render: (r: RunSummary) => (
+        <input type="checkbox"
+          checked={selectedIds.has(r.id)}
+          onChange={(e) => { e.stopPropagation(); toggleSelect(r.id); }}
+          onClick={(e) => e.stopPropagation()}
+          disabled={r.status !== 'PENDING_REVIEW'}
+          className="rounded border-gray-300 disabled:opacity-30"
+        />
+      ),
+    }] : []),
     {
       key: 'run_number',
       header: 'Run #',
@@ -874,6 +1628,41 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
         </div>
       )}
 
+      {/* Bulk action toolbar (Phase 4D) */}
+      {bulkEnabled && isReviewerOrAdmin && selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 p-3 bg-[#1B3A5C]/5 border border-[#1B3A5C]/20 rounded-lg">
+          <span className="text-sm font-semibold text-[#1B3A5C]">{selectedIds.size} selected</span>
+          <button
+            onClick={() => bulkReviewMut.mutate({ action: 'APPROVED' })}
+            disabled={bulkReviewMut.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+          >
+            <CheckCircle className="h-3 w-3" />
+            Approve All
+          </button>
+          <button
+            onClick={() => bulkReviewMut.mutate({ action: 'REJECTED' })}
+            disabled={bulkReviewMut.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50"
+          >
+            <XCircle className="h-3 w-3" />
+            Reject All
+          </button>
+          {adminSettings?.run_archival_enabled && (
+            <button
+              onClick={() => bulkArchiveMut.mutate()}
+              disabled={bulkArchiveMut.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50"
+            >
+              Archive
+            </button>
+          )}
+          <button onClick={clearSelection} className="ml-auto text-xs text-gray-500 hover:text-gray-700">
+            Clear selection
+          </button>
+        </div>
+      )}
+
       {/* Single runs table */}
       {(modeFilter === '' || modeFilter === 'SINGLE') && (
         <div>
@@ -893,6 +1682,7 @@ export default function RunHistoryPage({ defaultMode = '' }: RunHistoryPageProps
                   ? 'No runs match your filters'
                   : 'No runs yet. Click "New Run" to get started.'
               }
+              pageSize={50}
             />
           </Card>
         </div>

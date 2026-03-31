@@ -98,6 +98,99 @@ def _write_title_header_sep(ws, title: str, headers: list, merge_end_col: str, t
     ws.freeze_panes = "A4"
 
 
+def _build_match_type_distribution(ws, matched_pairs, suggested_matches=None):
+    """Build a match type distribution sheet with counts and amounts per match type."""
+    from collections import Counter, defaultdict
+    headers = ["Match Type", "Count", "Total 26AS Amt (Rs.)", "Avg Variance %", "Confidence"]
+    _write_title_header_sep(ws, "Match Type Distribution", headers, get_column_letter(len(headers)))
+
+    type_counts: Counter = Counter()
+    type_amounts: defaultdict = defaultdict(float)
+    type_variances: defaultdict = defaultdict(list)
+    type_confidence: defaultdict = defaultdict(list)
+
+    for mp in matched_pairs:
+        mt = mp.match_type or "UNKNOWN"
+        type_counts[mt] += 1
+        type_amounts[mt] += float(mp.as26_amount or 0)
+        type_variances[mt].append(float(mp.variance_pct or 0))
+        type_confidence[mt].append(mp.confidence or "")
+
+    if suggested_matches:
+        for s in suggested_matches:
+            mt = f"SUGGESTED_{s.match_type or 'UNKNOWN'}"
+            type_counts[mt] += 1
+            type_amounts[mt] += float(s.as26_amount or 0)
+            type_variances[mt].append(float(s.variance_pct or 0))
+            type_confidence[mt].append(s.confidence or "")
+
+    for r, mt in enumerate(sorted(type_counts.keys()), 4):
+        ws.cell(r, 1, mt).font = Font(bold=False, size=10, name="Calibri")
+        ws.cell(r, 2, type_counts[mt])
+        c = ws.cell(r, 3, type_amounts[mt])
+        c.number_format = '#,##0.00'
+        variances = type_variances[mt]
+        avg_var = sum(variances) / len(variances) if variances else 0
+        ws.cell(r, 4, round(avg_var, 2)).number_format = '0.00'
+        # Most common confidence
+        conf_list = type_confidence[mt]
+        most_common = Counter(conf_list).most_common(1)
+        ws.cell(r, 5, most_common[0][0] if most_common else "")
+
+    # Totals row
+    total_row = 4 + len(type_counts)
+    ws.cell(total_row, 1, "TOTAL").font = Font(bold=True, size=10, name="Calibri")
+    ws.cell(total_row, 2, sum(type_counts.values())).font = Font(bold=True, size=10, name="Calibri")
+    c = ws.cell(total_row, 3, sum(type_amounts.values()))
+    c.number_format = '#,##0.00'
+    c.font = Font(bold=True, size=10, name="Calibri")
+
+    for c in range(1, 6):
+        ws.column_dimensions[get_column_letter(c)].width = 22
+
+
+def _build_control_totals(ws, run, matched_pairs, unmatched_26as, suggested_matches=None):
+    """Build an amount-level control totals sheet verifying financial balancing."""
+    headers = ["Control Total", "Amount (Rs.)", "Count", "Status"]
+    _write_title_header_sep(ws, f"Control Totals — RUN-{run.run_number:04d}", headers, get_column_letter(len(headers)))
+
+    matched_amt = sum(float(m.as26_amount or 0) for m in matched_pairs)
+    unmatched_amt = sum(float(u.amount or 0) for u in unmatched_26as)
+    suggested_amt = sum(float(s.as26_amount or 0) for s in (suggested_matches or []))
+    total_26as = float(run.total_26as_amount or 0)
+    computed_total = matched_amt + unmatched_amt + suggested_amt
+    diff = abs(total_26as - computed_total)
+    balanced = diff < 1.0  # Allow Rs.1 rounding tolerance
+
+    rows = [
+        ("Total 26AS Amount", total_26as, run.total_26as_entries or 0, "Source"),
+        ("Matched Amount", matched_amt, len(matched_pairs), "Reconciled"),
+        ("Suggested Amount", suggested_amt, len(suggested_matches or []), "Pending Review"),
+        ("Unmatched 26AS Amount", unmatched_amt, len(unmatched_26as), "Unreconciled"),
+        ("", "", "", ""),
+        ("Computed Total (M+S+U)", computed_total, "", ""),
+        ("Difference", diff, "", "BALANCED" if balanced else "UNBALANCED"),
+    ]
+
+    for r, (label, amt, count, status) in enumerate(rows, 4):
+        ws.cell(r, 1, label).font = Font(bold=True, size=10, name="Calibri")
+        if isinstance(amt, (int, float)) and amt != "":
+            c = ws.cell(r, 2, amt)
+            c.number_format = '#,##0.00'
+        if count != "":
+            ws.cell(r, 3, count)
+        status_cell = ws.cell(r, 4, status)
+        if status == "BALANCED":
+            status_cell.font = Font(bold=True, color="2E7D32", size=10, name="Calibri")
+            status_cell.fill = _fill(VAR_GREEN)
+        elif status == "UNBALANCED":
+            status_cell.font = Font(bold=True, color=CRITICAL_RED, size=10, name="Calibri")
+            status_cell.fill = _fill(VAR_RED)
+
+    for c in range(1, 5):
+        ws.column_dimensions[get_column_letter(c)].width = 28
+
+
 # ── Single-run Excel ─────────────────────────────────────────────────────────
 
 def generate_excel_v2(
@@ -108,6 +201,11 @@ def generate_excel_v2(
     exceptions: List[ExceptionRecord],
     suggested_matches: List[SuggestedMatch] | None = None,
     variance_thresholds: tuple[float, float] = (1.0, 3.0),
+    amount_control_totals_enabled: bool = True,
+    match_type_distribution_enabled: bool = True,
+    variance_analysis_enabled: bool = True,
+    watermark_text: str | None = None,
+    redact_pan: bool = False,
 ) -> bytes:
     # Deduplicate matched pairs by as26_row_hash (safety net)
     seen_hashes: set = set()
@@ -144,9 +242,25 @@ def generate_excel_v2(
     ws_unbks = wb.create_sheet("Unmatched SAP Books")
     _build_unmatched_books(ws_unbks, unmatched_books)
 
-    if matched_pairs:
+    if variance_analysis_enabled and matched_pairs:
         ws_var = wb.create_sheet("Variance Analysis")
         _build_variance(ws_var, matched_pairs)
+
+    # Phase 3G: Amount-level control totals
+    if amount_control_totals_enabled:
+        ws_ct = wb.create_sheet("Control Totals")
+        _build_control_totals(ws_ct, run, matched_pairs, unmatched_26as, suggested_matches)
+
+    # Phase 3H: Match type distribution
+    if match_type_distribution_enabled and matched_pairs:
+        ws_dist = wb.create_sheet("Match Distribution")
+        _build_match_type_distribution(ws_dist, matched_pairs, suggested_matches)
+
+    # Phase 7E: Apply watermark to all sheets
+    if watermark_text:
+        for ws_wm in wb.worksheets:
+            ws_wm.oddHeader.center.text = watermark_text
+            ws_wm.oddFooter.center.text = watermark_text
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -433,6 +547,12 @@ def _build_unmatched_books(ws, entries: List[UnmatchedBook]):
 def generate_batch_excel(
     runs_data: List[dict],
     variance_thresholds: tuple[float, float] = (1.0, 3.0),
+    template: str = "standard",
+    amount_control_totals_enabled: bool = True,
+    match_type_distribution_enabled: bool = True,
+    variance_analysis_enabled: bool = True,
+    watermark_text: str | None = None,
+    redact_pan: bool = False,
 ) -> bytes:
     """Generate a combined Excel workbook for a batch of runs.
 
@@ -557,6 +677,10 @@ def generate_batch_excel(
                 seen_hashes.add(h)
             matched_pairs.append(mp)
 
+        # Skip per-party detail sheets for "summary" template
+        if template == "summary":
+            continue
+
         # Excel sheet names max 31 chars, must be unique, no invalid chars
         raw_name = run.deductor_name or run.tan or f"Run-{run.run_number}"
         safe_name = re.sub(r'[\\/*?:\[\]]', '_', raw_name)
@@ -610,6 +734,37 @@ def generate_batch_excel(
             ws_bks = wb.create_sheet(bks_sheet_name)
             _build_unmatched_books(ws_bks, unmatched_books)
 
+    # Phase 3G/3H: Aggregate control totals and distribution for batch
+    if amount_control_totals_enabled and runs_data:
+        # Build aggregate control totals using first run as template
+        all_matched = []
+        all_unmatched = []
+        all_suggested = []
+        for rd in runs_data:
+            all_matched.extend(rd.get("matched_pairs", []))
+            all_unmatched.extend(rd.get("unmatched_26as", []))
+            all_suggested.extend(rd.get("suggested_matches", []))
+        # Use first run for header info
+        first_run = runs_data[0]["run"]
+        ws_ct = wb.create_sheet("Control Totals")
+        _build_control_totals(ws_ct, first_run, all_matched, all_unmatched, all_suggested)
+
+    if match_type_distribution_enabled and runs_data:
+        all_matched_dist = []
+        all_suggested_dist = []
+        for rd in runs_data:
+            all_matched_dist.extend(rd.get("matched_pairs", []))
+            all_suggested_dist.extend(rd.get("suggested_matches", []))
+        if all_matched_dist:
+            ws_dist = wb.create_sheet("Match Distribution")
+            _build_match_type_distribution(ws_dist, all_matched_dist, all_suggested_dist or None)
+
+    # Phase 7E: Apply watermark to all sheets
+    if watermark_text:
+        for ws_wm in wb.worksheets:
+            ws_wm.oddHeader.center.text = watermark_text
+            ws_wm.oddFooter.center.text = watermark_text
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -656,3 +811,151 @@ def _build_variance(ws, pairs: List[MatchedPair]):
     ws.column_dimensions["A"].width = 20
     ws.column_dimensions["B"].width = 12
     ws.column_dimensions["C"].width = 16
+
+
+# ── Compliance Report (Phase 4F) ─────────────────────────────────────────────
+
+def generate_compliance_report(
+    run: ReconciliationRun,
+    matched_pairs: List[MatchedPair],
+    unmatched_26as: List[Unmatched26AS],
+    exceptions: List[ExceptionRecord],
+    suggested_matches: List[SuggestedMatch] = None,
+) -> io.BytesIO:
+    """Generate audit-ready compliance report for regulatory filing."""
+    wb = Workbook()
+
+    # ── Sheet 1: Compliance Summary ──
+    ws = wb.active
+    ws.title = "Compliance Summary"
+    ws.sheet_properties.tabColor = NAVY
+
+    # Header
+    ws.merge_cells("A1:F1")
+    ws.cell(1, 1, "TDS RECONCILIATION — COMPLIANCE REPORT").font = Font(bold=True, size=14, color=WHITE, name="Calibri")
+    ws.cell(1, 1).fill = _fill(NAVY)
+    ws.cell(1, 1).alignment = _align("center")
+
+    meta = [
+        ("Run ID", run.id),
+        ("Run Number", f"#{run.run_number}"),
+        ("Deductor", run.deductor_name or "—"),
+        ("TAN", run.tan or "—"),
+        ("Financial Year", run.financial_year),
+        ("Status", run.status),
+        ("Algorithm Version", run.algorithm_version),
+        ("SAP File Hash (SHA-256)", run.sap_file_hash),
+        ("26AS File Hash (SHA-256)", run.as26_file_hash),
+        ("Processing Date", run.completed_at.strftime("%Y-%m-%d %H:%M UTC") if run.completed_at else "—"),
+        ("Report Generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
+    ]
+    for i, (label, val) in enumerate(meta, 3):
+        ws.cell(i, 1, label).font = Font(bold=True, size=10, name="Calibri")
+        ws.cell(i, 2, val).font = Font(size=10, name="Calibri")
+        ws.merge_cells(f"B{i}:F{i}")
+
+    # Reconciliation stats
+    stats_row = len(meta) + 5
+    ws.merge_cells(f"A{stats_row}:F{stats_row}")
+    ws.cell(stats_row, 1, "RECONCILIATION STATISTICS").font = Font(bold=True, size=12, color=WHITE, name="Calibri")
+    ws.cell(stats_row, 1).fill = _fill(NAVY)
+
+    stats = [
+        ("Total 26AS Entries", run.total_26as_entries or 0),
+        ("Total SAP Entries", run.total_sap_entries or 0),
+        ("Matched Entries", run.matched_count or 0),
+        ("Suggested Matches (Pending)", run.suggested_count or 0),
+        ("Unmatched 26AS Entries", run.unmatched_26as_count or 0),
+        ("Match Rate (%)", f"{run.match_rate_pct:.2f}%"),
+        ("Total 26AS Amount (₹)", f"₹{run.total_26as_amount or 0:,.2f}"),
+        ("Matched Amount (₹)", f"₹{run.matched_amount or 0:,.2f}"),
+        ("Unmatched Exposure (₹)", f"₹{run.unmatched_26as_amount or 0:,.2f}"),
+        ("Constraint Violations", run.constraint_violations or 0),
+        ("Control Total Balanced", "YES" if run.control_total_balanced else "NO"),
+    ]
+    for i, (label, val) in enumerate(stats, stats_row + 1):
+        ws.cell(i, 1, label).font = Font(bold=True, size=10, name="Calibri")
+        ws.cell(i, 2, str(val)).font = Font(size=10, name="Calibri")
+
+    # Confidence breakdown
+    conf_row = stats_row + len(stats) + 2
+    ws.cell(conf_row, 1, "Confidence Breakdown").font = Font(bold=True, size=11, name="Calibri")
+    ws.cell(conf_row + 1, 1, "HIGH").font = Font(size=10, name="Calibri")
+    ws.cell(conf_row + 1, 2, run.high_confidence_count or 0)
+    ws.cell(conf_row + 2, 1, "MEDIUM").font = Font(size=10, name="Calibri")
+    ws.cell(conf_row + 2, 2, run.medium_confidence_count or 0)
+    ws.cell(conf_row + 3, 1, "LOW").font = Font(size=10, name="Calibri")
+    ws.cell(conf_row + 3, 2, run.low_confidence_count or 0)
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 25
+
+    # ── Sheet 2: Exception Register ──
+    ws_exc = wb.create_sheet("Exception Register")
+    ws_exc.sheet_properties.tabColor = "C62828"
+    exc_headers = ["#", "Type", "Severity", "Description", "26AS Amount", "Details", "Reviewed"]
+    for c, h in enumerate(exc_headers, 1):
+        cell = ws_exc.cell(1, c, h)
+        cell.font = Font(bold=True, size=10, color=WHITE, name="Calibri")
+        cell.fill = _fill("C62828")
+    for i, e in enumerate(exceptions, 2):
+        ws_exc.cell(i, 1, i - 1)
+        ws_exc.cell(i, 2, e.exception_type or "—")
+        ws_exc.cell(i, 3, e.severity or "—")
+        ws_exc.cell(i, 4, e.description or "—")
+        ws_exc.cell(i, 5, e.as26_amount or 0)
+        ws_exc.cell(i, 5).number_format = "#,##0.00"
+        ws_exc.cell(i, 6, e.details or "—")
+        ws_exc.cell(i, 7, "Yes" if e.reviewed else "No")
+
+    # ── Sheet 3: Unmatched Exposure ──
+    ws_um = wb.create_sheet("Unmatched Exposure")
+    ws_um.sheet_properties.tabColor = "E65100"
+    um_headers = ["#", "Deductor", "TAN", "Date", "Amount (₹)", "Section", "Reason"]
+    for c, h in enumerate(um_headers, 1):
+        cell = ws_um.cell(1, c, h)
+        cell.font = Font(bold=True, size=10, color=WHITE, name="Calibri")
+        cell.fill = _fill("E65100")
+    for i, e in enumerate(unmatched_26as, 2):
+        ws_um.cell(i, 1, i - 1)
+        ws_um.cell(i, 2, e.deductor_name or "—")
+        ws_um.cell(i, 3, e.tan or "—")
+        ws_um.cell(i, 4, e.as26_date or "—")
+        ws_um.cell(i, 5, e.as26_amount or 0)
+        ws_um.cell(i, 5).number_format = "#,##0.00"
+        ws_um.cell(i, 6, e.section or "—")
+        ws_um.cell(i, 7, e.reason_code or "—")
+
+    # ── Sheet 4: Certification ──
+    ws_cert = wb.create_sheet("Certification")
+    ws_cert.sheet_properties.tabColor = "1B5E20"
+    ws_cert.merge_cells("A1:D1")
+    ws_cert.cell(1, 1, "RECONCILIATION CERTIFICATION").font = Font(bold=True, size=14, color=WHITE, name="Calibri")
+    ws_cert.cell(1, 1).fill = _fill("1B5E20")
+    ws_cert.cell(1, 1).alignment = _align("center")
+
+    cert_lines = [
+        f"I hereby certify that the TDS reconciliation for {run.deductor_name or 'the deductor'} ({run.tan or 'TAN N/A'})",
+        f"for the financial year {run.financial_year} has been completed as detailed in this report.",
+        "",
+        f"Match Rate: {run.match_rate_pct:.2f}%",
+        f"Total Matched Amount: ₹{run.matched_amount or 0:,.2f}",
+        f"Unmatched Exposure: ₹{run.unmatched_26as_amount or 0:,.2f}",
+        f"Exceptions Raised: {len(exceptions)}",
+        "",
+        "Prepared by: ____________________________    Date: ________________",
+        "",
+        "Reviewed by: ____________________________    Date: ________________",
+        "",
+        "Partner/Director: _______________________    Date: ________________",
+    ]
+    for i, line in enumerate(cert_lines, 3):
+        ws_cert.cell(i, 1, line).font = Font(size=11, name="Calibri")
+        ws_cert.merge_cells(f"A{i}:D{i}")
+
+    ws_cert.column_dimensions["A"].width = 80
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf

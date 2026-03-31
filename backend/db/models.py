@@ -108,6 +108,9 @@ class ReconciliationRun(Base):
         nullable=False, default="SINGLE"
     )
     batch_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    batch_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    batch_tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)  # ["quarterly", "urgent"]
+    parent_batch_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)  # rerun lineage
 
     # Results summary
     total_26as_entries: Mapped[int] = mapped_column(Integer, default=0)
@@ -146,6 +149,10 @@ class ReconciliationRun(Base):
     reviewed_by_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     review_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    assigned_reviewer_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    assigned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Timestamps
     created_by_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
@@ -404,10 +411,215 @@ class AdminSettings(Base):
     clearing_group_variance_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
     proxy_clearing_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, default=None)
 
+    # ── Batch Processing (Phase 1) ───────────────────────────────────────────
+    batch_concurrency_limit: Mapped[int] = mapped_column(Integer, default=10)  # max parallel runs per batch
+    batch_parse_cache_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # parse 26AS once per batch
+    batch_invoice_dedup_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # cross-run invoice uniqueness
+    batch_control_total_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # batch-level sum assertion
+
+    # ── Batch Processing (Phase 2) ───────────────────────────────────────────
+    batch_auto_retry_count: Mapped[int] = mapped_column(Integer, default=0)  # 0 = disabled, 1-3 retries on failure
+    batch_duplicate_detection_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # cross-batch same-file detection
+    batch_progress_dashboard_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # aggregate progress view
+    batch_comparison_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # side-by-side batch comparison
+    batch_variance_trend_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # historical trend analysis
+    batch_export_template: Mapped[str] = mapped_column(String(50), default="standard")  # standard | ca_review | itr_filing | management
+    batch_notification_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # webhook on batch complete/fail
+    batch_notification_webhook_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True, default=None)
+    batch_scheduling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # scheduled batch reruns
+
+    # ── Reconciliation Intelligence (Phase 3) ─────────────────────────────────
+    section_filter_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # match within same tax section only
+    invoice_date_proximity_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # penalize large date gaps in scoring
+    max_date_gap_days: Mapped[int] = mapped_column(Integer, default=90)  # max days between 26AS and invoice date
+    as26_duplicate_check_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # flag duplicate Status=F entries
+    credit_note_handling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # parse negative SAP amounts as adjustments
+    bipartite_matching_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # graph-based global optimization
+    enumerate_alternatives_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # top 3 alternatives per suggested match
+    amount_control_totals_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # verify amount balancing in Excel
+    match_type_distribution_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # track EXACT/SINGLE/COMBO/FORCE breakdown
+    pan_detection_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # PAN & 206AA TDS rate analysis
+    large_batch_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # memory limits & perf tuning
+    max_sap_rows_per_run: Mapped[int] = mapped_column(Integer, default=100000)  # cap per-run SAP row count
+
+    # ── Workflow & Compliance (Phase 4) ────────────────────────────────────────
+    approval_workflow_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # approve/reject on run detail
+    comment_threads_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # per-run comment system
+    reviewer_assignment_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # assign runs to reviewers
+    bulk_operations_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # bulk approve/reject/export
+    run_archival_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # archive old runs
+    archival_retention_days: Mapped[int] = mapped_column(Integer, default=365)  # days before archiving
+    compliance_report_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # audit-ready compliance Excel
+    data_quality_precheck_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # pre-match data profiling
+    custom_exception_rules_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # user-defined exception triggers
+    run_comparison_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # side-by-side run diff
+    enhanced_webhook_enabled: Mapped[bool] = mapped_column(Boolean, default=False)  # retry, signatures, payload config
+    webhook_retry_count: Mapped[int] = mapped_column(Integer, default=3)  # webhook delivery retries
+    webhook_secret: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)  # HMAC signing secret
+
+    # ── Advanced Tuning & Profiles (Phase 5) ──────────────────────────────────
+    # 5A: Exception severity thresholds
+    high_value_threshold: Mapped[float] = mapped_column(Float, default=1000000.0)
+    auto_escalate_high_value: Mapped[bool] = mapped_column(Boolean, default=True)
+    force_match_exception_severity: Mapped[str] = mapped_column(String(20), default="HIGH")
+    # 5B: Scoring weight configuration
+    score_weight_variance: Mapped[float] = mapped_column(Float, default=30.0)
+    score_weight_date: Mapped[float] = mapped_column(Float, default=20.0)
+    score_weight_section: Mapped[float] = mapped_column(Float, default=20.0)
+    score_weight_clearing: Mapped[float] = mapped_column(Float, default=20.0)
+    score_weight_historical: Mapped[float] = mapped_column(Float, default=10.0)
+    custom_scoring_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 5C: Variance tier ceilings
+    variance_ceiling_single_pct: Mapped[float] = mapped_column(Float, default=2.0)
+    variance_ceiling_combo_pct: Mapped[float] = mapped_column(Float, default=3.0)
+    variance_ceiling_force_single_pct: Mapped[float] = mapped_column(Float, default=5.0)
+    variance_ceiling_force_combo_pct: Mapped[float] = mapped_column(Float, default=2.0)
+    custom_variance_ceilings_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 5D: Combo heuristics
+    combo_iteration_budget: Mapped[int] = mapped_column(Integer, default=50000)
+    combo_pool_cap: Mapped[int] = mapped_column(Integer, default=5000)
+    combo_date_window_days: Mapped[int] = mapped_column(Integer, default=30)
+    # 5E: Date proximity profiles
+    date_proximity_profile: Mapped[str] = mapped_column(String(20), default="STANDARD")
+    filing_lag_days_tolerance: Mapped[int] = mapped_column(Integer, default=45)
+    # 5F: Clearing document rules
+    clearing_doc_bonus_score: Mapped[float] = mapped_column(Float, default=20.0)
+    proxy_clearing_date_window_days: Mapped[int] = mapped_column(Integer, default=30)
+    # 5G: Rate & section validation
+    rate_tolerance_pct: Mapped[float] = mapped_column(Float, default=2.0)
+    rate_mismatch_severity: Mapped[str] = mapped_column(String(20), default="MEDIUM")
+    # 5H: Parser & cleaner profiles
+    parser_lenient_mode: Mapped[bool] = mapped_column(Boolean, default=True)
+    cleaner_duplicate_strategy: Mapped[str] = mapped_column(String(30), default="FIRST_OCCURRENCE")
+    # 5I: Excel export templates
+    export_show_score_breakdown: Mapped[bool] = mapped_column(Boolean, default=True)
+    export_template_active: Mapped[str] = mapped_column(String(30), default="standard")
+    # 5J: Dashboard metrics
+    dashboard_match_rate_target_pct: Mapped[float] = mapped_column(Float, default=75.0)
+    dashboard_variance_warning_pct: Mapped[float] = mapped_column(Float, default=5.0)
+    dashboard_exclude_failed_from_trends: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # ── Reporting, Intelligence & Safety (Phase 6) ─────────────────────────────
+    # 6A: Confidence tier thresholds
+    confidence_high_variance_threshold: Mapped[float] = mapped_column(Float, default=1.0)
+    confidence_medium_variance_threshold: Mapped[float] = mapped_column(Float, default=5.0)
+    confidence_score_boost_threshold: Mapped[float] = mapped_column(Float, default=70.0)
+    # 6B: Exact match tolerance
+    exact_tolerance_rupees: Mapped[float] = mapped_column(Float, default=0.01)
+    # 6C: Auto-approval rules
+    auto_approval_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_approval_min_match_rate: Mapped[float] = mapped_column(Float, default=75.0)
+    auto_approval_max_exceptions: Mapped[int] = mapped_column(Integer, default=10)
+    # 6D: Section confidence boost
+    high_confidence_sections: Mapped[str] = mapped_column(String(200), default="194C,194J,194H,194I,194A")
+    section_confidence_boost_pct: Mapped[float] = mapped_column(Float, default=60.0)
+    # 6E: Unmatched amount alerting
+    unmatched_alerting_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    unmatched_critical_amount_threshold: Mapped[float] = mapped_column(Float, default=500000.0)
+    unmatched_critical_count_threshold: Mapped[int] = mapped_column(Integer, default=50)
+    # 6F: Force match distribution alert
+    force_match_alert_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    force_match_alert_pct_threshold: Mapped[float] = mapped_column(Float, default=10.0)
+    # 6G: Audit log retention
+    audit_log_retention_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    audit_log_retention_days: Mapped[int] = mapped_column(Integer, default=1095)
+    audit_log_redact_amounts: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 6H: Excel sheet selection
+    excel_include_match_distribution: Mapped[bool] = mapped_column(Boolean, default=True)
+    excel_include_control_totals: Mapped[bool] = mapped_column(Boolean, default=True)
+    excel_include_variance_analysis: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 6I: Run display preferences
+    run_detail_default_sort: Mapped[str] = mapped_column(String(20), default="variance")
+    run_detail_items_per_page: Mapped[int] = mapped_column(Integer, default=50)
+    run_detail_show_score_columns: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 6J: Batch display preferences
+    batch_hide_zero_match_parties: Mapped[bool] = mapped_column(Boolean, default=False)
+    batch_summary_sort_by: Mapped[str] = mapped_column(String(20), default="match_rate")
+    batch_trend_window_days: Mapped[int] = mapped_column(Integer, default=90)
+
+    # ── Security, Governance & Data Controls (Phase 7) ──────────────────────────
+    # 7A: Session policies
+    session_inactivity_timeout_min: Mapped[int] = mapped_column(Integer, default=30)
+    max_concurrent_sessions: Mapped[int] = mapped_column(Integer, default=3)
+    force_reauth_on_approve: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7B: Password rules
+    password_min_length: Mapped[int] = mapped_column(Integer, default=8)
+    password_require_mixed_case: Mapped[bool] = mapped_column(Boolean, default=True)
+    password_require_number: Mapped[bool] = mapped_column(Boolean, default=True)
+    password_expiry_days: Mapped[int] = mapped_column(Integer, default=0)
+    # 7C: Login protection
+    max_failed_login_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    login_lockout_duration_min: Mapped[int] = mapped_column(Integer, default=15)
+    notify_admin_on_lockout: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7D: Data retention policies
+    run_retention_days: Mapped[int] = mapped_column(Integer, default=365)
+    auto_archive_after_days: Mapped[int] = mapped_column(Integer, default=90)
+    purge_exports_after_days: Mapped[int] = mapped_column(Integer, default=30)
+    # 7E: Export security
+    export_watermark_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    export_watermark_text: Mapped[str] = mapped_column(String(100), default="CONFIDENTIAL")
+    export_require_approval: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7F: PII protection
+    redact_tan_in_logs: Mapped[bool] = mapped_column(Boolean, default=False)
+    redact_pan_in_exports: Mapped[bool] = mapped_column(Boolean, default=False)
+    mask_amounts_in_preview: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7G: Import validation
+    max_upload_size_mb: Mapped[int] = mapped_column(Integer, default=50)
+    max_rows_per_file: Mapped[int] = mapped_column(Integer, default=100000)
+    reject_empty_columns: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7H: Anomaly detection
+    anomaly_detection_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    amount_outlier_stddev: Mapped[float] = mapped_column(Float, default=3.0)
+    match_rate_drop_alert_pct: Mapped[float] = mapped_column(Float, default=20.0)
+    # 7I: Batch recovery
+    batch_retry_backoff_seconds: Mapped[int] = mapped_column(Integer, default=2)
+    batch_stop_on_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    batch_partial_resume_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 7J: System health alerts
+    system_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    slow_run_threshold_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    high_exception_rate_pct: Mapped[float] = mapped_column(Float, default=50.0)
+
     # Metadata
     updated_by_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+# ── Run Comments (Phase 4B) ──────────────────────────────────────────────────
+
+class RunComment(Base):
+    """Thread-style comments on a reconciliation run."""
+    __tablename__ = "run_comments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("reconciliation_runs.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("run_comments.id"), nullable=True)  # reply threading
+    context_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # 'match', 'exception', 'general'
+    context_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)  # ID of match/exception if contextual
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, onupdate=_utcnow)
+
+
+# ── Custom Exception Rules (Phase 4H) ───────────────────────────────────────
+
+class CustomExceptionRule(Base):
+    """User-defined exception rules that trigger during reconciliation."""
+    __tablename__ = "custom_exception_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    field: Mapped[str] = mapped_column(String(50), nullable=False)  # 'amount', 'variance_pct', 'section', 'match_type'
+    operator: Mapped[str] = mapped_column(String(20), nullable=False)  # 'gt', 'lt', 'eq', 'gte', 'lte', 'contains', 'in'
+    value: Mapped[str] = mapped_column(String(500), nullable=False)  # threshold value (string, parsed at runtime)
+    severity: Mapped[str] = mapped_column(String(20), default="MEDIUM")  # CRITICAL, HIGH, MEDIUM, LOW
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, onupdate=_utcnow)
 
 
 # ── Suggested Matches ────────────────────────────────────────────────────────

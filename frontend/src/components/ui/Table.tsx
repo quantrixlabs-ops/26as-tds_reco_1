@@ -4,6 +4,7 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { TablePagination } from './TablePagination';
 
 export interface Column<T> {
   key: string;
@@ -25,6 +26,10 @@ interface TableProps<T> {
   className?: string;
   rowClassName?: (row: T) => string;
   stickyHeader?: boolean;
+  /** Enable built-in pagination when data exceeds this threshold (default: off) */
+  pageSize?: number;
+  /** Minimum rows before pagination appears (default: 25) */
+  paginationThreshold?: number;
 }
 
 type SortDir = 'asc' | 'desc' | null;
@@ -45,9 +50,13 @@ export function Table<T extends object>({
   className,
   rowClassName,
   stickyHeader = false,
+  pageSize: initialPageSize,
+  paginationThreshold = 25,
 }: TableProps<T>) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(initialPageSize ?? 50);
 
   const handleSort = (key: string) => {
     if (sortKey !== key) {
@@ -80,6 +89,11 @@ export function Table<T extends object>({
       return bs < as ? -1 : bs > as ? 1 : 0;
     });
   })();
+
+  const usePagination = !!initialPageSize && sortedData.length > paginationThreshold;
+  const pagedData = usePagination
+    ? sortedData.slice((page - 1) * pageSize, page * pageSize)
+    : sortedData;
 
   const alignClass = (align?: 'left' | 'right' | 'center') => {
     if (align === 'right') return 'text-right';
@@ -135,7 +149,7 @@ export function Table<T extends object>({
                 ))}
               </tr>
             ))
-          ) : sortedData.length === 0 ? (
+          ) : pagedData.length === 0 ? (
             <tr>
               <td
                 colSpan={columns.length}
@@ -145,7 +159,7 @@ export function Table<T extends object>({
               </td>
             </tr>
           ) : (
-            sortedData.map((row, idx) => (
+            pagedData.map((row, idx) => (
               <tr
                 key={keyExtractor(row, idx)}
                 className={cn(
@@ -174,6 +188,15 @@ export function Table<T extends object>({
           )}
         </tbody>
       </table>
+      {usePagination && (
+        <TablePagination
+          page={page}
+          pageSize={pageSize}
+          total={sortedData.length}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => { setPageSize(s); setPage(1); }}
+        />
+      )}
     </div>
   );
 }

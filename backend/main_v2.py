@@ -85,6 +85,47 @@ async def lifespan(app: FastAPI):
             if fixed:
                 logger.info("recount_healed", runs_fixed=fixed)
 
+        # Phase 6G: Audit log retention — purge old logs on startup if enabled
+        from db.models import AdminSettings as _AS
+        _as_result = await session.execute(select(_AS).where(_AS.is_active == True))
+        _as_row = _as_result.scalar_one_or_none()
+        if _as_row and getattr(_as_row, 'audit_log_retention_enabled', False):
+            _ret_days = getattr(_as_row, 'audit_log_retention_days', 1095) or 1095
+            from core.audit import purge_old_audit_logs, purge_old_db_audit_logs
+            disk_result = purge_old_audit_logs(_ret_days)
+            db_deleted = await purge_old_db_audit_logs(session, _ret_days)
+            if disk_result["deleted"] or db_deleted:
+                logger.info("audit_retention_purge", disk=disk_result, db_deleted=db_deleted)
+
+        # Phase 7D: Data retention — archive/purge old runs on startup
+        if _as_row:
+            _archive_days = getattr(_as_row, 'auto_archive_after_days', 0) or 0
+            _purge_days = getattr(_as_row, 'run_retention_days', 0) or 0
+            if _archive_days > 0 or _purge_days > 0:
+                from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                _now = _dt.now(_tz.utc)
+                _archived = 0
+                _purged = 0
+                if _archive_days > 0:
+                    _archive_cutoff = _now - _td(days=_archive_days)
+                    _arch_result = await session.execute(
+                        sql_text(
+                            "UPDATE reconciliation_runs SET status='ARCHIVED' "
+                            "WHERE status IN ('APPROVED','PENDING_REVIEW') AND created_at < :cutoff"
+                        ),
+                        {"cutoff": _archive_cutoff},
+                    )
+                    _archived = _arch_result.rowcount or 0
+                if _purge_days > 0:
+                    _purge_cutoff = _now - _td(days=_purge_days)
+                    _purge_result = await session.execute(
+                        sql_text("DELETE FROM reconciliation_runs WHERE created_at < :cutoff"),
+                        {"cutoff": _purge_cutoff},
+                    )
+                    _purged = _purge_result.rowcount or 0
+                if _archived or _purged:
+                    logger.info("data_retention_cleanup", archived=_archived, purged=_purged)
+
         await session.commit()
 
     yield

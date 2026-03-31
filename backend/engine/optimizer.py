@@ -56,6 +56,52 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+def _effective_variance_cap(cfg: MatchConfig, match_kind: str) -> float:
+    """Return the effective variance ceiling for a given match kind.
+
+    Phase 5C: When custom_variance_ceilings_enabled is True, use per-type caps
+    from MatchConfig. Otherwise, fall back to global constants.
+    """
+    if getattr(cfg, 'custom_variance_ceilings_enabled', False):
+        caps = {
+            "SINGLE": cfg.variance_ceiling_single_pct,
+            "COMBO": cfg.variance_ceiling_combo_pct,
+            "FORCE_SINGLE": cfg.variance_ceiling_force_single_pct,
+            "FORCE_COMBO": cfg.variance_ceiling_force_combo_pct,
+        }
+        return caps.get(match_kind, VARIANCE_CAP_SINGLE)
+    # Default: use global constants
+    return {
+        "SINGLE": VARIANCE_CAP_SINGLE,
+        "COMBO": VARIANCE_CAP_COMBO,
+        "FORCE_SINGLE": VARIANCE_CAP_FORCE_SINGLE,
+        "FORCE_COMBO": FORCE_COMBO_MAX_VARIANCE,
+    }.get(match_kind, VARIANCE_CAP_SINGLE)
+
+
+def _scorer_kwargs(cfg: MatchConfig) -> dict:
+    """Build extra kwargs for score_candidate from MatchConfig (Phase 5B/5F)."""
+    kw: dict = {}
+    if getattr(cfg, 'custom_scoring_enabled', False):
+        kw['weights'] = {
+            "variance": cfg.score_weight_variance,
+            "date": cfg.score_weight_date,
+            "section": cfg.score_weight_section,
+            "clearing": cfg.score_weight_clearing,
+            "historical": cfg.score_weight_historical,
+        }
+    bonus = getattr(cfg, 'clearing_doc_bonus_score', None)
+    if bonus is not None and bonus != 20.0:
+        kw['clearing_doc_bonus'] = bonus
+    # Phase 6D: section confidence boost
+    hi_sec = getattr(cfg, 'high_confidence_sections', None)
+    sec_boost = getattr(cfg, 'section_confidence_boost_pct', None)
+    if hi_sec or (sec_boost is not None and sec_boost != 60.0):
+        sections = {s.strip() for s in (hi_sec or "194C,194J,194H,194I,194A").split(",")}
+        kw['section_boost_config'] = {"sections": sections, "boost_pct": sec_boost or 60.0}
+    return kw
+
+
 @dataclass
 class BookEntry:
     index: int
@@ -160,6 +206,50 @@ def _categorize_suggested(var_pct: float, date_category: str, cfg: MatchConfig) 
     return "TIER_CAP_EXCEEDED", False
 
 
+# ── Alternative match enumeration (Phase 3F) ────────────────────────────────
+
+def _enumerate_alternatives(
+    results: List["AssignmentResult"],
+    book_pool: List[BookEntry],
+    used_book_indices: Set[int],
+    consumed_invoice_refs: Set[int],
+    cfg: "MatchConfig",
+    top_n: int = 3,
+) -> None:
+    """For each suggested match, find up to top_n alternative book candidates.
+
+    Mutates results in place, populating alternative_matches.
+    """
+    # Build quick lookup: all books not consumed by this specific result
+    for result in results:
+        if not result.suggested:
+            continue
+        own_indices = {b.index for b in result.books}
+        # Candidates: any unused book (or the result's own books) within variance ceiling
+        target = result.as26_amount
+        if target <= 0:
+            continue
+        alts = []
+        for b in book_pool:
+            if b.index in own_indices:
+                continue
+            if b.amount <= 0:
+                continue
+            var_pct = abs(target - b.amount) / target * 100
+            if var_pct > cfg.variance_suggested_ceiling_pct:
+                continue
+            alts.append({
+                "invoice_ref": b.invoice_ref,
+                "amount": b.amount,
+                "doc_date": b.doc_date,
+                "variance_pct": round(var_pct, 2),
+                "consumed": b.index in consumed_invoice_refs,
+            })
+        # Sort by variance (best first), take top_n
+        alts.sort(key=lambda a: a["variance_pct"])
+        result.alternative_matches = alts[:top_n]
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 class CancelledException(Exception):
@@ -208,6 +298,11 @@ def run_global_optimizer(
     consumed_invoice_refs: Set[int] = set()  # book index -- uniquely identifies each book entry
     all_results: List[AssignmentResult] = []
 
+    # Section affinity: clearing_doc → section (built from committed matches)
+    # When section_filter_enabled, books with a clearing_doc already assigned to
+    # one section won't be matched to a different section.
+    section_affinity: Dict[str, str] = {}
+
     effective_allow_cross_fy = cfg.allow_cross_fy or allow_cross_fy
     active_books = current_books if not effective_allow_cross_fy else book_pool
 
@@ -227,6 +322,14 @@ def run_global_optimizer(
         phase_a_matched = []
         phase_a_unmatched = as26_entries
 
+    # Build section affinity from Phase A results
+    if cfg.section_filter_enabled:
+        for r in all_results:
+            if r.as26_section:
+                for b in r.books:
+                    if b.clearing_doc:
+                        section_affinity[b.clearing_doc] = r.as26_section
+
     # ── Phase B: Bipartite single + smart combo ──────────────────────────────
     logger.info("optimizer.phase_b_start")
     _progress("PHASE_B_SINGLE", 0, len(phase_a_unmatched),
@@ -235,8 +338,17 @@ def run_global_optimizer(
     phase_b_results, phase_b_unmatched = _phase_b_global(
         phase_a_unmatched, active_books, used_book_indices, consumed_invoice_refs, cfg,
         progress_cb=progress_cb, matched_so_far=_count_normal(all_results),
+        section_affinity=section_affinity if cfg.section_filter_enabled else None,
     )
     all_results.extend(phase_b_results)
+
+    # Update section affinity from Phase B
+    if cfg.section_filter_enabled:
+        for r in phase_b_results:
+            if r.as26_section:
+                for b in r.books:
+                    if b.clearing_doc:
+                        section_affinity[b.clearing_doc] = r.as26_section
 
     # ── Phase B.2: Relaxed Individual Matching ────────────────────────────────
     # Retry unmatched entries with relaxed parameters: wider date window (180 days),
@@ -260,9 +372,11 @@ def run_global_optimizer(
             combo_iteration_budget=cfg.combo_iteration_budget,
             exact_tolerance=cfg.exact_tolerance,
             date_clustering_preference=cfg.date_clustering_preference,
+            section_filter_enabled=cfg.section_filter_enabled,
         )
         phase_b2_results, phase_b2_unmatched = _phase_b_global(
-            phase_b_unmatched, active_books, used_book_indices, consumed_invoice_refs, relaxed_cfg
+            phase_b_unmatched, active_books, used_book_indices, consumed_invoice_refs, relaxed_cfg,
+            section_affinity=section_affinity if cfg.section_filter_enabled else None,
         )
         # Tag relaxed matches for audit trail
         for r in phase_b2_results:
@@ -348,6 +462,10 @@ def run_global_optimizer(
     _validate_compliance(normal_results, effective_allow_cross_fy, cfg)
     _progress("POST_VALIDATE", 1, 1, _count_normal(all_results), "Compliance checks passed")
 
+    # ── Alternative match enumeration (Phase 3F) ──────────────────────────
+    if getattr(cfg, 'enumerate_alternatives_enabled', False):
+        _enumerate_alternatives(all_results, book_pool, used_book_indices, consumed_invoice_refs, cfg)
+
     logger.info("optimizer.complete",
                 matched=_count_normal(all_results),
                 suggested=_count_suggested(all_results),
@@ -382,8 +500,14 @@ def _phase_a_clearing_groups(
         if b.clearing_doc and b.clearing_doc not in ("", "0"):
             groups[b.clearing_doc].append(b)
 
-    # Filter: groups of 2-max_combo_size only
-    max_grp = cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE
+    # Filter: groups of 2-MAX_COMBO_SIZE only.
+    # Clearing groups are natural invoice groupings by clearing document — they should
+    # be small (2-5 books). The hard-coded MAX_COMBO_SIZE (5) is the correct cap here,
+    # NOT the admin's max_combo_size (which governs combo matching in Phase B).
+    # Large clearing docs (e.g., 50+ books) are payment batches, not real matched groups.
+    # Using admin's max_combo_size=5000 here caused Phase A to consume 85%+ of all books,
+    # leaving Phase B with almost nothing for combo matching → cascading U02 starvation.
+    max_grp = MAX_COMBO_SIZE
     valid_groups = {k: v for k, v in groups.items() if 2 <= len(v) <= max_grp}
 
     # Pre-compute group sums and check availability once
@@ -430,7 +554,7 @@ def _phase_a_clearing_groups(
                 sap_fy=group[0].sap_fy,
             )
             score = score_candidate(target, as26.transaction_date, as26.section, candidate,
-                                     enforce_before=cfg.enforce_books_before_26as)
+                                     enforce_before=cfg.enforce_books_before_26as, **_scorer_kwargs(cfg))
 
             # Deterministic tie-breaking: higher score wins; on tie, lower clr_doc wins
             if score.total > best_score or (score.total == best_score and best_result and clr_doc < best_result[3]):
@@ -451,7 +575,7 @@ def _phase_a_clearing_groups(
                 match_type=f"CLR_GROUP_{len(books)}",
                 variance_pct=round(var_pct, 4),
                 variance_amt=round(target - sum(b.amount for b in books), 2),
-                confidence=_confidence(var_pct, "CLR_GROUP", score),
+                confidence=_confidence(var_pct, "CLR_GROUP", score, cfg=cfg),
                 score=score,
             ))
         else:
@@ -483,7 +607,7 @@ def _proxy_clearing_groups(
     from collections import defaultdict
 
     excluded = used_book_indices | consumed_invoice_refs
-    max_grp = cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE
+    max_grp = MAX_COMBO_SIZE  # Proxy groups: same cap as clearing groups (not admin's combo size)
     clr_cap = cfg.clearing_group_variance_pct if cfg.clearing_group_variance_pct is not None else cfg.variance_normal_ceiling_pct
 
     # Cluster available books by doc_date
@@ -542,7 +666,7 @@ def _proxy_clearing_groups(
                 sap_fy=avail[0].sap_fy,
             )
             score = score_candidate(target, as26.transaction_date, as26.section, candidate,
-                                     enforce_before=cfg.enforce_books_before_26as)
+                                     enforce_before=cfg.enforce_books_before_26as, **_scorer_kwargs(cfg))
             if score.total > best_score:
                 best_score = score.total
                 best_result = (avail, score, var_pct)
@@ -561,7 +685,7 @@ def _proxy_clearing_groups(
                 match_type=f"PROXY_GROUP_{len(books)}",
                 variance_pct=round(var_pct, 4),
                 variance_amt=round(target - sum(b.amount for b in books), 2),
-                confidence=_confidence(var_pct, "PROXY_GROUP", score),
+                confidence=_confidence(var_pct, "PROXY_GROUP", score, cfg=cfg),
                 score=score,
                 alert_message="Matched via date-clustered proxy group (no clearing doc)",
             ))
@@ -581,6 +705,7 @@ def _phase_b_global(
     cfg: MatchConfig,
     progress_cb: Optional[callable] = None,
     matched_so_far: int = 0,
+    section_affinity: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[AssignmentResult], List[As26Entry]]:
     """
     Phase B: widened candidate search with variance routing.
@@ -597,7 +722,8 @@ def _phase_b_global(
     _progress("PHASE_B_SINGLE", 0, len(as26_entries), matched_so_far,
               f"Scoring single candidates across {len(as26_entries)} x {len(book_pool)} pairs...")
     all_candidates = _build_single_candidates(
-        as26_entries, book_pool, used_book_indices, consumed_invoice_refs, cfg
+        as26_entries, book_pool, used_book_indices, consumed_invoice_refs, cfg,
+        section_affinity=section_affinity,
     )
     _progress("PHASE_B_SINGLE", 30, 100, matched_so_far,
               f"Built {len(all_candidates)} single candidates. Running bipartite...")
@@ -609,24 +735,40 @@ def _phase_b_global(
     normal_candidates: Dict[Tuple[int, int], Tuple] = {}
     soft_candidates: Dict[Tuple[int, int], Tuple] = {}
 
+    # When single_sweep_before_combo is enabled, feed ALL candidates to bipartite.
+    # This lets bipartite commit books for 1:1 matches globally-optimally BEFORE
+    # combo matching runs, preventing combos from stealing books needed by smaller
+    # entries (the U02 "invoice already matched" starvation problem).
+    # Above-ceiling matches are still reclassified as "suggested" for CA review,
+    # but their books ARE committed — blocking combo consumption.
+    widen_bipartite = cfg.single_sweep_before_combo
+
     for key in sorted(all_candidates.keys()):  # deterministic iteration by (as26_idx, book_idx)
         val = all_candidates[key]
         score_val, var_pct, match_type, score_obj, book, date_cat, alert, days_gap = val
-        # Route to bipartite if within auto-confirm ceiling
-        # Categories: "" (normal), "HIGH_VARIANCE_3_20", "DATE_SOFT_PREFERENCE" all go to bipartite
-        # Only "HIGH_VARIANCE_20_PLUS" or above ceiling goes to suggested
-        if var_pct <= auto_confirm_cap:
+        if widen_bipartite or var_pct <= auto_confirm_cap:
             normal_candidates[key] = val
         else:
             soft_candidates[key] = val
 
     # Bipartite on normal candidates
-    if SCIPY_AVAILABLE and normal_candidates:
+    # bipartite_matching_enabled (Phase 3E): when True, use scipy bipartite; when False, force greedy
+    # When single_sweep_before_combo is enabled, force bipartite even if admin disabled it —
+    # bipartite's globally optimal 1:1 assignment distributes books fairly across entries,
+    # preventing the U02 cascade where greedy assigns a book to entry A while entry B has
+    # no other candidate and ends up unmatched.
+    use_bipartite = SCIPY_AVAILABLE and (
+        cfg.bipartite_matching_enabled if hasattr(cfg, 'bipartite_matching_enabled') else True
+    ) or (SCIPY_AVAILABLE and widen_bipartite)
+    if use_bipartite and normal_candidates:
         bip_matched, bip_unmatched, bip_used = _bipartite_match(
             as26_entries, normal_candidates, used_book_indices, consumed_invoice_refs, cfg
         )
     elif normal_candidates:
-        logger.warning("scipy unavailable -- using greedy fallback for single matches")
+        if not SCIPY_AVAILABLE:
+            logger.warning("scipy unavailable -- using greedy fallback for single matches")
+        else:
+            logger.info("bipartite_matching_enabled=False -- using greedy for single matches")
         bip_matched, bip_unmatched, bip_used = _greedy_single(
             as26_entries, normal_candidates, used_book_indices, consumed_invoice_refs, cfg
         )
@@ -655,11 +797,12 @@ def _phase_b_global(
             reclassified_bip.append(r)
         else:
             # Within admin ceiling — auto-confirmed
-            if r.variance_pct > VARIANCE_CAP_SINGLE:
+            eff_single_cap = _effective_variance_cap(cfg, "SINGLE")
+            if r.variance_pct > eff_single_cap:
                 # Above base tier cap but within admin ceiling — flag for awareness
                 r.alert_message = (
                     f"Auto-confirmed at {r.variance_pct:.1f}% variance "
-                    f"(above base {VARIANCE_CAP_SINGLE}% cap, within admin ceiling {effective_ceiling}%)"
+                    f"(above base {eff_single_cap}% cap, within admin ceiling {effective_ceiling}%)"
                 )
                 r.ai_risk_flag = True
                 r.ai_risk_reason = f"High variance auto-confirmed: {r.variance_pct:.1f}%"
@@ -699,7 +842,7 @@ def _phase_b_global(
             days_gap=days_gap,
         ))
 
-    # Merge reclassified bipartite results into suggestions
+    # Merge reclassified bipartite results
     for r in reclassified_bip:
         suggested.append(r)
 
@@ -713,8 +856,7 @@ def _phase_b_global(
             best_suggested[s.as26_index] = s
     suggested = [best_suggested[k] for k in sorted(best_suggested.keys())]  # deterministic order
 
-    # Combo matching for ALL unmatched — don't exclude entries with single suggestions,
-    # because a combo at 1% may be far better than a single suggestion at 15%
+    # Combo matching for remaining unmatched
     combo_unmatched = list(bip_unmatched)
     if combo_unmatched:
         _progress("PHASE_B_COMBO", 0, len(combo_unmatched),
@@ -752,6 +894,7 @@ def _build_single_candidates(
     used_book_indices: Set[int],
     consumed_invoice_refs: Set[int],
     cfg: MatchConfig,
+    section_affinity: Optional[Dict[str, str]] = None,
 ) -> Dict[Tuple[int, int], Tuple[float, float, str, ScoreBreakdown, BookEntry, str, str, Optional[int]]]:
     """
     Build single-book candidate matches for all 26AS entries.
@@ -797,11 +940,22 @@ def _build_single_candidates(
         for idx in range(lo, hi):
             b = available[idx]
 
+            # Section affinity filter: skip if clearing_doc is locked to a different section
+            if section_affinity and a_section and b.clearing_doc:
+                locked_section = section_affinity.get(b.clearing_doc)
+                if locked_section and locked_section != a_section:
+                    continue
+
             # Date eligibility check
             days_gap = _compute_days_gap(a_date, b.doc_date)
             eligible, date_cat = _is_date_eligible(days_gap, cfg)
             if not eligible:
                 continue
+
+            # Invoice date proximity hard cap
+            if cfg.invoice_date_proximity_enabled and days_gap is not None:
+                if abs(days_gap) > cfg.max_date_gap_days:
+                    continue
 
             var_pct = (target - b.amount) / target * 100
             if var_pct < 0:
@@ -817,7 +971,7 @@ def _build_single_candidates(
                 sap_fy=b.sap_fy,
             )
             score = score_candidate(target, a_date, a_section, candidate,
-                                     enforce_before=cfg.enforce_books_before_26as)
+                                     enforce_before=cfg.enforce_books_before_26as, **_scorer_kwargs(cfg))
 
             # Determine the overall category for this candidate
             # Date soft preference takes priority, then variance tier
@@ -893,7 +1047,7 @@ def _bipartite_match(
             match_type=match_type,
             variance_pct=round(var_pct, 4),
             variance_amt=round(as26.amount - book.amount, 2),
-            confidence=_confidence(var_pct, match_type, score_obj),
+            confidence=_confidence(var_pct, match_type, score_obj, cfg=cfg),
             score=score_obj,
             days_gap=days_gap,
         ))
@@ -936,7 +1090,7 @@ def _greedy_single(
             books=[book], match_type=match_type,
             variance_pct=round(var_pct, 4),
             variance_amt=round(as26.amount - book.amount, 2),
-            confidence=_confidence(var_pct, match_type, score_obj), score=score_obj,
+            confidence=_confidence(var_pct, match_type, score_obj, cfg=cfg), score=score_obj,
             days_gap=days_gap,
         ))
 
@@ -954,9 +1108,13 @@ def _smart_combo_match(
     cfg: MatchConfig,
 ) -> Tuple[List[AssignmentResult], List[As26Entry]]:
     """
-    Date-clustered combo matching using greedy accumulation + subset-sum DP.
-    Returns (results, unmatched) where results may include both normal and suggested.
-    Hard timeout guard: if combo matching takes too long, bail out gracefully.
+    Two-pass combo matching using greedy accumulation + subset-sum DP.
+
+    Pass 1: Small combos only (2-5 books) for ALL entries — preserves book pool.
+    Pass 2: Larger combos (up to admin max_combo_size) for remaining entries.
+
+    This prevents large combos from depleting books that smaller entries need,
+    which was the root cause of cascading U02 starvation.
     """
     import time
     from config import COMBO_TIMEOUT_SECONDS
@@ -971,68 +1129,71 @@ def _smart_combo_match(
     sorted_books = sorted(book_pool, key=lambda b: b.amount)
     sorted_amounts = [b.amount for b in sorted_books]
 
-    for as26 in as26_entries:
-        # Timeout guard: if combo matching exceeded time budget, route remaining to unmatched
-        if time.monotonic() - combo_start_time > COMBO_TIMEOUT_SECONDS:
-            logger.warning(f"Combo timeout after {COMBO_TIMEOUT_SECONDS}s — "
-                           f"{len(as26_entries) - len(results) - len(unmatched)} entries skipped")
-            unmatched.extend(e for e in as26_entries
-                             if e.index not in {r.as26_index for r in results}
-                             and e not in unmatched)
-            break
+    admin_max_size = cfg.max_combo_size if cfg.max_combo_size > 0 else MAX_COMBO_SIZE
+    small_cap = min(MAX_COMBO_SIZE, admin_max_size)
+    combo_ceiling = cfg.variance_normal_ceiling_pct
 
-        target = as26.amount
-        tol = target + cfg.exact_tolerance
-        a_date = as26.transaction_date
+    # Process smallest entries first within each pass
+    sorted_entries = sorted(as26_entries, key=lambda e: e.amount)
 
-        # Use bisect to narrow to books with amount <= tol
-        hi = bisect.bisect_right(sorted_amounts, tol)
+    # Two-pass: small combos first, then larger if admin allows
+    passes = [small_cap]
+    if admin_max_size > small_cap:
+        passes.append(admin_max_size)
 
-        eligible: List[Tuple[BookEntry, Optional[int], str]] = []
-        for idx in range(hi):
-            b = sorted_books[idx]
-            if b.index in excluded:
+    matched_ids: Set[int] = set()
+
+    for pass_idx, max_size in enumerate(passes):
+        for as26 in sorted_entries:
+            if as26.index in matched_ids:
                 continue
-            days_gap = _compute_days_gap(a_date, b.doc_date)
-            date_eligible, date_cat = _is_date_eligible(days_gap, cfg)
-            if not date_eligible:
+
+            if time.monotonic() - combo_start_time > COMBO_TIMEOUT_SECONDS:
+                logger.warning(f"Combo timeout after {COMBO_TIMEOUT_SECONDS}s in pass {pass_idx+1}")
+                break
+
+            target = as26.amount
+            tol = target + cfg.exact_tolerance
+            a_date = as26.transaction_date
+
+            hi = bisect.bisect_right(sorted_amounts, tol)
+
+            eligible: List[Tuple[BookEntry, Optional[int], str]] = []
+            for idx in range(hi):
+                b = sorted_books[idx]
+                if b.index in excluded:
+                    continue
+                days_gap = _compute_days_gap(a_date, b.doc_date)
+                date_eligible, date_cat = _is_date_eligible(days_gap, cfg)
+                if not date_eligible:
+                    continue
+                eligible.append((b, days_gap if days_gap is not None else 999, date_cat))
+
+            if len(eligible) < 2:
                 continue
-            eligible.append((b, days_gap if days_gap is not None else 999, date_cat))
 
-        if len(eligible) < 2:
-            unmatched.append(as26)
-            continue
+            if cfg.date_clustering_preference:
+                eligible.sort(key=lambda x: abs(x[1]))
+            eligible = eligible[:cfg.combo_pool_cap]
 
-        # Sort by date proximity (closest first) — date clustering preference
-        if cfg.date_clustering_preference:
-            eligible.sort(key=lambda x: abs(x[1]))
+            best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
 
-        # Cap the pool
-        eligible = eligible[:cfg.combo_pool_cap]
+            if best_result is None:
+                amounts = [b.amount for b, _, _ in eligible]
+                dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
+                if dp_indices is not None:
+                    best_result = [eligible[i] for i in dp_indices]
 
-        max_size = cfg.max_combo_size if cfg.max_combo_size > 0 else len(eligible)
+            if best_result is None:
+                continue  # try next pass or remain unmatched
 
-        # Try greedy accumulation first — use admin ceiling for combo acceptance
-        combo_ceiling = cfg.variance_normal_ceiling_pct
-        best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
-
-        if best_result is None:
-            # Try subset-sum DP on the pool
-            amounts = [b.amount for b, _, _ in eligible]
-            dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size, variance_ceiling=combo_ceiling)
-            if dp_indices is not None:
-                best_result = [eligible[i] for i in dp_indices]
-
-        if best_result is not None:
             # best_result is a list of (book, days_gap, date_cat) tuples
             books = [b for b, _, _ in best_result]
             books_sum = sum(b.amount for b in books)
             var_pct = (target - books_sum) / target * 100 if target > 0 else 100.0
 
             if var_pct < 0:
-                # books_sum > target: over-claim prevention, skip
-                unmatched.append(as26)
-                continue
+                continue  # books_sum > target: over-claim prevention
 
             worst_date_cat = ""
             for _, _, dc in best_result:
@@ -1043,7 +1204,6 @@ def _smart_combo_match(
             combo_size = len(books)
             match_type = f"COMBO_{combo_size}"
 
-            # Score the combo
             clr_docs = set(b.clearing_doc for b in books)
             clr_doc = books[0].clearing_doc if len(clr_docs) == 1 else None
             candidate = BookCandidate(
@@ -1054,13 +1214,12 @@ def _smart_combo_match(
                 sap_fy=books[0].sap_fy,
             )
             score_obj = score_candidate(target, a_date, as26.section, candidate,
-                                         enforce_before=cfg.enforce_books_before_26as)
+                                         enforce_before=cfg.enforce_books_before_26as, **_scorer_kwargs(cfg))
 
             alert = ""
             if worst_date_cat == "DATE_SOFT_PREFERENCE":
                 alert = "Contains invoices 90-180 days from 26AS date"
 
-            # Route based on admin ceiling — matches within admin ceiling auto-confirmed
             is_suggested = var_pct > cfg.variance_normal_ceiling_pct
 
             if is_suggested:
@@ -1079,6 +1238,7 @@ def _smart_combo_match(
                     requires_remarks=req_remarks, alert_message=alert,
                 )
                 results.append(result)
+                matched_ids.add(as26.index)
             else:
                 result = AssignmentResult(
                     as26_index=as26.index, as26_amount=target,
@@ -1086,10 +1246,9 @@ def _smart_combo_match(
                     books=books, match_type=match_type,
                     variance_pct=round(var_pct, 4),
                     variance_amt=round(target - books_sum, 2),
-                    confidence=_confidence(var_pct, match_type, score_obj),
+                    confidence=_confidence(var_pct, match_type, score_obj, cfg=cfg),
                     score=score_obj,
                 )
-                # Flag auto-confirmed high-variance combos
                 if var_pct > cfg.variance_normal_ceiling_pct:
                     result.alert_message = (
                         f"Auto-confirmed combo at {var_pct:.1f}% variance "
@@ -1101,9 +1260,10 @@ def _smart_combo_match(
                 for b in books:
                     excluded.add(b.index)
                 results.append(result)
-        else:
-            unmatched.append(as26)
+                matched_ids.add(as26.index)
 
+    # Collect truly unmatched (not matched in any pass)
+    unmatched = [e for e in as26_entries if e.index not in matched_ids]
     return results, unmatched
 
 
@@ -1172,12 +1332,13 @@ def _subset_sum_dp(
     int_target = int(round((target + tolerance) * scale))
     int_amounts = [int(round(a * scale)) for a in amounts]
 
-    # Cap DP table size to prevent memory/time explosion
-    # If target is too large, use a coarser scale
-    max_dp_size = 500_000  # maximum cells in DP table
-    if int_target * min(max_size, n) > max_dp_size:
-        # Use coarser scaling
-        coarse_scale = max(1, int_target * min(max_size, n) // max_dp_size)
+    # Cap DP iteration budget to prevent time explosion.
+    # The DP is 1D (table size = int_target), iterated n times. Total work: n × int_target.
+    # max_size is a count constraint checked inside the loop, NOT a table dimension —
+    # so it must not inflate the coarse-scaling factor.
+    max_iterations = 2_000_000  # ~0.2s in CPython — keeps event loop responsive
+    if n * int_target > max_iterations:
+        coarse_scale = max(1, n * int_target // max_iterations)
         int_target = int_target // coarse_scale
         int_amounts = [a // coarse_scale for a in int_amounts]
         if int_target <= 0:
@@ -1312,19 +1473,23 @@ def _force_match_one(
         FORCE_COMBO_MAX_INVOICES,
     )
 
+    # Phase 5C: resolve effective variance ceilings for force matches
+    eff_force_combo_cap = _effective_variance_cap(cfg, "FORCE_COMBO")
+    eff_force_single_cap = _effective_variance_cap(cfg, "FORCE_SINGLE")
+
     # Try greedy accumulation first (allows single + combo, capped at max_size_combo)
-    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size_combo, variance_ceiling=FORCE_COMBO_MAX_VARIANCE)
+    best_result = _greedy_accumulate(target, eligible, cfg.exact_tolerance, max_size_combo, variance_ceiling=eff_force_combo_cap)
     if best_result is None:
         amounts = [b.amount for b, _, _ in eligible]
-        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size_combo, variance_ceiling=FORCE_COMBO_MAX_VARIANCE)
+        dp_indices = _subset_sum_dp(target, amounts, cfg.exact_tolerance, max_size_combo, variance_ceiling=eff_force_combo_cap)
         if dp_indices is not None:
             best_result = [eligible[idx] for idx in dp_indices]
 
     # Also try single best match (greedy may have skipped it)
-    # Enforce FORCE_SINGLE 5% variance cap here (Brief §3/#4)
+    # Enforce FORCE_SINGLE cap here (Brief §3/#4)
     if best_result is None and eligible:
         best_single = None
-        best_single_var = VARIANCE_CAP_FORCE_SINGLE  # Cap at 5%, not 100%
+        best_single_var = eff_force_single_cap  # Cap (default 5%)
         for b, dg, dc in eligible:
             if b.amount <= target + cfg.exact_tolerance:
                 var = (target - b.amount) / target * 100 if target > 0 else 100.0
@@ -1358,14 +1523,14 @@ def _force_match_one(
 
     # ── Enforce tier-specific force-match caps (Brief §3/#3 and §3/#4) ────
     if combo_size == 1:
-        # FORCE_SINGLE: reject if variance exceeds 5% cap
-        if var_pct > VARIANCE_CAP_FORCE_SINGLE:
+        # FORCE_SINGLE: reject if variance exceeds cap (Phase 5C configurable)
+        if var_pct > eff_force_single_cap:
             return None, True
     else:
-        # FORCE_COMBO: reject if >3 invoices or >2% variance
+        # FORCE_COMBO: reject if >3 invoices or above cap (Phase 5C configurable)
         if combo_size > FORCE_COMBO_MAX_INVOICES:
             return None, True
-        if var_pct > FORCE_COMBO_MAX_VARIANCE:
+        if var_pct > eff_force_combo_cap:
             return None, True
 
     clr_docs = set(b.clearing_doc for b in books)
@@ -1378,7 +1543,7 @@ def _force_match_one(
         sap_fy=books[0].sap_fy,
     )
     score_obj = score_candidate(target, a_date, as26.section, candidate,
-                                 enforce_before=cfg.enforce_books_before_26as)
+                                 enforce_before=cfg.enforce_books_before_26as, **_scorer_kwargs(cfg))
 
     if var_pct > cfg.variance_suggested_ceiling_pct:
         cat, req_remarks = "HIGH_VARIANCE_20_PLUS", True
@@ -1517,27 +1682,36 @@ def _is_fy_boundary_zone(date_str: Optional[str], days: int = 60) -> bool:
     return any(abs((d - b).days) <= days for b in boundaries)
 
 
-def _confidence(variance_pct: float, match_type: str, score: Optional[ScoreBreakdown] = None) -> str:
+def _confidence(
+    variance_pct: float,
+    match_type: str,
+    score: Optional[ScoreBreakdown] = None,
+    cfg: Optional[MatchConfig] = None,
+) -> str:
     """Determine confidence tier from variance, match type, and composite score.
 
-    Tiers:
-        HIGH:   exact/near-exact (≤1%), non-force, OR high composite score (≥70) with ≤2%
-        MEDIUM: 1–5% variance non-force, OR composite score ≥50
-        LOW:    FORCE, PRIOR, PROXY, or high variance (>5%)
+    Phase 6A: Thresholds are configurable via cfg:
+    - cfg.confidence_high_variance_threshold (default 1.0%)
+    - cfg.confidence_medium_variance_threshold (default 5.0%)
+    - cfg.confidence_score_boost_threshold (default 70.0)
     """
+    high_var = getattr(cfg, 'confidence_high_variance_threshold', 1.0) if cfg else 1.0
+    med_var = getattr(cfg, 'confidence_medium_variance_threshold', 5.0) if cfg else 5.0
+    score_boost = getattr(cfg, 'confidence_score_boost_threshold', 70.0) if cfg else 70.0
+
     if "FORCE" in match_type or "PRIOR" in match_type:
         return "LOW"
     if "PROXY" in match_type:
-        return "MEDIUM" if variance_pct <= 1.0 else "LOW"
+        return "MEDIUM" if variance_pct <= high_var else "LOW"
     # Use composite score to boost confidence when available
     composite = score.total if score else 0.0
-    if variance_pct <= 1.0:
+    if variance_pct <= high_var:
         return "HIGH"
-    if variance_pct <= 2.0 and composite >= 70.0:
+    if variance_pct <= high_var * 2 and composite >= score_boost:
         return "HIGH"
-    if variance_pct <= 5.0:
+    if variance_pct <= med_var:
         return "MEDIUM"
-    if composite >= 50.0:
+    if composite >= score_boost * 0.7:
         return "MEDIUM"
     return "LOW"
 

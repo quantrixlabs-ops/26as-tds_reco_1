@@ -39,7 +39,7 @@ ALLOW_CROSS_FY: bool = False
 AUTO_APPROVAL_MIN_MATCH_RATE: float = 75.0  # Runs below this match rate require manual review
 MIN_APPROVAL_MATCH_RATE: float = 75.0       # Reviewer cannot approve below this (same for consistency)
 HIGH_VALUE_THRESHOLD: float = 1_000_000     # ₹10 lakh — unmatched 26AS entries above this are CRITICAL
-COMBO_TIMEOUT_SECONDS: int = 30             # Hard cap on combo matching time per entry
+COMBO_TIMEOUT_SECONDS: int = 120            # Hard cap on combo matching time (total across all entries)
 
 # ── Cleaning Pipeline ─────────────────────────────────────────────────────────
 NOISE_THRESHOLD: float = 1.0    # Rows with amount < ₹1 are excluded (keep all meaningful amounts)
@@ -155,10 +155,95 @@ class MatchConfig:
     clearing_group_variance_pct: float | None = None  # None = inherit variance_normal_ceiling_pct
     proxy_clearing_enabled: bool = True
 
+    # Phase 3: Reconciliation Intelligence
+    section_filter_enabled: bool = False       # Match within same tax section only
+    invoice_date_proximity_enabled: bool = False  # Penalize large date gaps in scoring
+    max_date_gap_days: int = 90                # Max days between 26AS and invoice date (proximity)
+    bipartite_matching_enabled: bool = False    # Use scipy bipartite over greedy fallback
+    enumerate_alternatives_enabled: bool = False  # Top 3 alternatives per suggested match
+
+    # Phase B single sweep: claim best 1:1 matches before combo to prevent U02 starvation
+    single_sweep_before_combo: bool = True
+
     # Internals (not user-configurable)
     exact_tolerance: float = 0.01
     combo_pool_cap: int = 5000
     combo_iteration_budget: int = 50_000
+
+    # Phase 5A: Exception severity thresholds
+    high_value_threshold: float = 1_000_000.0
+    auto_escalate_high_value: bool = True
+    force_match_exception_severity: str = "HIGH"
+
+    # Phase 5B: Scoring weights (percentage points, must sum to 100)
+    score_weight_variance: float = 30.0
+    score_weight_date: float = 20.0
+    score_weight_section: float = 20.0
+    score_weight_clearing: float = 20.0
+    score_weight_historical: float = 10.0
+    custom_scoring_enabled: bool = False
+
+    # Phase 5C: Variance tier ceilings
+    variance_ceiling_single_pct: float = 2.0
+    variance_ceiling_combo_pct: float = 3.0
+    variance_ceiling_force_single_pct: float = 5.0
+    variance_ceiling_force_combo_pct: float = 2.0
+    custom_variance_ceilings_enabled: bool = False
+
+    # Phase 5D: Combo heuristics
+    combo_date_window_days: int = 30
+
+    # Phase 5E: Date proximity profiles
+    date_proximity_profile: str = "STANDARD"
+    filing_lag_days_tolerance: int = 45
+
+    # Phase 5F: Clearing document rules
+    clearing_doc_bonus_score: float = 20.0
+    proxy_clearing_date_window_days: int = 30
+
+    # Phase 5G: Rate & section validation
+    rate_tolerance_pct: float = 2.0
+    rate_mismatch_severity: str = "MEDIUM"
+
+    # Phase 5H: Parser & cleaner profiles
+    parser_lenient_mode: bool = True
+    cleaner_duplicate_strategy: str = "FIRST_OCCURRENCE"
+
+    # Phase 6A: Confidence tier thresholds
+    confidence_high_variance_threshold: float = 1.0
+    confidence_medium_variance_threshold: float = 5.0
+    confidence_score_boost_threshold: float = 70.0
+
+    # Phase 6B: Exact match tolerance (overrides exact_tolerance)
+    # exact_tolerance already exists above; this aliases to it via _load_match_config
+
+    # Phase 6C: Auto-approval rules
+    auto_approval_enabled: bool = False
+    auto_approval_min_match_rate: float = 75.0
+    auto_approval_max_exceptions: int = 10
+
+    # Phase 6D: Section confidence boost
+    high_confidence_sections: str = "194C,194J,194H,194I,194A"
+    section_confidence_boost_pct: float = 60.0
+
+    # Phase 6E: Unmatched amount alerting
+    unmatched_alerting_enabled: bool = True
+    unmatched_critical_amount_threshold: float = 500_000.0
+    unmatched_critical_count_threshold: int = 50
+
+    # Phase 6F: Force match distribution alert
+    force_match_alert_enabled: bool = True
+    force_match_alert_pct_threshold: float = 10.0
+
+    # Phase 7H: Anomaly detection
+    anomaly_detection_enabled: bool = False
+    amount_outlier_stddev: float = 3.0
+    match_rate_drop_alert_pct: float = 20.0
+
+    # Phase 7J: System health alerts
+    system_alerts_enabled: bool = False
+    slow_run_threshold_seconds: int = 300
+    high_exception_rate_pct: float = 50.0
 
     def to_dict(self) -> dict:
         from dataclasses import asdict

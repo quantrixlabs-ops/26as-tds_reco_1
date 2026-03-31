@@ -142,6 +142,7 @@ def clean_sap_books(
     doc_types_include: Optional[set] = None,
     doc_types_exclude: Optional[set] = None,
     exclude_sgl_v: bool = True,
+    credit_note_handling_enabled: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
     """
     Parse and clean a raw SAP AR ledger Excel file.
@@ -205,7 +206,15 @@ def clean_sap_books(
             continue
 
         # ── Non-positive ────────────────────────────────────────────────────
-        if amount <= 0:
+        is_credit_note = False
+        if amount < 0:
+            if credit_note_handling_enabled:
+                is_credit_note = True
+                amount = abs(amount)  # Store as positive, flag as credit note
+            else:
+                c.negative += 1
+                continue
+        elif amount == 0:
             c.negative += 1
             continue
 
@@ -249,6 +258,10 @@ def clean_sap_books(
 
         # ── P4: Compute SAP FY from doc_date ────────────────────────────────
         sap_fy = date_to_fy_label(doc_date) if doc_date else ""
+
+        # ── Credit note flag ──────────────────────────────────────────────
+        if is_credit_note:
+            flag = f"{flag},CREDIT_NOTE".strip(",") if flag else "CREDIT_NOTE"
 
         # ── Collect ─────────────────────────────────────────────────────────
         record = {

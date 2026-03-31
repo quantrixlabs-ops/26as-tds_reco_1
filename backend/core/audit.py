@@ -123,10 +123,19 @@ def _write_to_disk(
     user_id: Optional[str],
     metadata: Optional[dict],
     ts: datetime,
+    redact_amounts: bool = False,
+    redact_tan: bool = False,
 ) -> None:
     """Append an HMAC-chained JSON line to the daily audit log file."""
     date_str = ts.strftime("%Y-%m-%d")
     log_file = _audit_dir / f"audit_{date_str}.jsonl"
+
+    # Phase 6G: optionally redact financial amounts
+    if redact_amounts:
+        description = _redact_amounts(description)
+    # Phase 7F: optionally redact TAN numbers (ABCD12345X → ABCD*****X)
+    if redact_tan:
+        description = _redact_tans(description)
 
     record = {
         "ts": ts.isoformat(),
@@ -209,3 +218,65 @@ def log_sync(
     now = datetime.now(timezone.utc)
     _write_to_disk(event_type, description, run_id, user_id, metadata, now)
     logger.info(event_type, description=description, run_id=run_id, **({} if metadata is None else metadata))
+
+
+# ── Phase 6G: Audit log retention ─────────────────────────────────────────
+
+import re
+from datetime import timedelta
+
+
+def purge_old_audit_logs(retention_days: int = 1095) -> dict:
+    """
+    Delete JSONL audit log files older than retention_days.
+    Returns summary: {"deleted": int, "kept": int, "errors": list}.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    deleted, kept, errors = 0, 0, []
+    date_pattern = re.compile(r"audit_(\d{4}-\d{2}-\d{2})\.jsonl")
+    for f in _audit_dir.iterdir():
+        m = date_pattern.match(f.name)
+        if not m:
+            continue
+        file_date = m.group(1)
+        if file_date < cutoff_str:
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError as e:
+                errors.append(f"{f.name}: {e}")
+        else:
+            kept += 1
+    return {"deleted": deleted, "kept": kept, "errors": errors}
+
+
+async def purge_old_db_audit_logs(db: AsyncSession, retention_days: int = 1095) -> int:
+    """
+    Delete AuditLog DB rows older than retention_days.
+    Returns count of deleted rows.
+    """
+    from db.models import AuditLog
+    from sqlalchemy import delete
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    result = await db.execute(
+        delete(AuditLog).where(AuditLog.created_at < cutoff)
+    )
+    return result.rowcount or 0
+
+
+_AMOUNT_PATTERN = re.compile(r"₹[\d,]+\.?\d*")
+
+
+def _redact_amounts(text: str) -> str:
+    """Replace financial amounts (₹1,234.56) with ₹[REDACTED]."""
+    return _AMOUNT_PATTERN.sub("₹[REDACTED]", text)
+
+
+_TAN_PATTERN = re.compile(r"\b([A-Z]{4})[A-Z0-9]{5}([A-Z])\b")
+
+
+def _redact_tans(text: str) -> str:
+    """Mask TAN numbers: ABCD12345X → ABCD*****X."""
+    return _TAN_PATTERN.sub(r"\1*****\2", text)

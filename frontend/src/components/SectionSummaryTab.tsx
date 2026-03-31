@@ -1,13 +1,15 @@
 /**
- * SectionSummaryTab — TDS section-wise breakdown of matched pairs
- * Groups matched pairs by section code (e.g., 194C, 194J, 194H) and shows
- * aggregate statistics per section.
+ * SectionSummaryTab — TDS section-wise breakdown of matched pairs.
+ * Sortable columns for analytics.
  */
+import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { runsApi, type MatchedPair, type ConfidenceTier } from '../lib/api';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { cn, formatCurrency, formatPct, confidenceVariant } from '../lib/utils';
+import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react';
+import { TableExport } from '../components/ui/TableExport';
 
 interface SectionSummaryTabProps {
   runId: string;
@@ -77,9 +79,14 @@ function groupBySection(pairs: MatchedPair[]): SectionGroup[] {
     });
   }
 
-  // Sort by total 26AS amount descending
-  groups.sort((a, b) => b.totalAs26Amount - a.totalAs26Amount);
   return groups;
+}
+
+type SortKey = 'section' | 'count' | 'totalAs26Amount' | 'totalBooksSum' | 'avgVariancePct';
+
+function SortIcon({ active, dir }: { active: boolean; dir: 'asc' | 'desc' }) {
+  if (!active) return <ChevronsUpDown className="h-3 w-3 opacity-30" />;
+  return dir === 'asc' ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />;
 }
 
 export default function SectionSummaryTab({ runId }: SectionSummaryTabProps) {
@@ -87,6 +94,27 @@ export default function SectionSummaryTab({ runId }: SectionSummaryTabProps) {
     queryKey: ['runs', runId, 'matched'],
     queryFn: () => runsApi.matched(runId),
   });
+
+  const [sortKey, setSortKey] = useState<SortKey>('totalAs26Amount');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortKey(key); setSortDir(key === 'section' ? 'asc' : 'desc'); }
+  };
+
+  const groups = useMemo(() => {
+    const raw = groupBySection(pairs);
+    return [...raw].sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      if (typeof av === 'number' && typeof bv === 'number')
+        return sortDir === 'asc' ? av - bv : bv - av;
+      return sortDir === 'asc'
+        ? String(av).localeCompare(String(bv))
+        : String(bv).localeCompare(String(av));
+    });
+  }, [pairs, sortKey, sortDir]);
 
   if (isLoading) {
     return (
@@ -97,8 +125,6 @@ export default function SectionSummaryTab({ runId }: SectionSummaryTabProps) {
       </Card>
     );
   }
-
-  const groups = groupBySection(pairs);
 
   if (groups.length === 0) {
     return (
@@ -114,41 +140,54 @@ export default function SectionSummaryTab({ runId }: SectionSummaryTabProps) {
   const totalAs26 = groups.reduce((s, g) => s + g.totalAs26Amount, 0);
   const totalBooks = groups.reduce((s, g) => s + g.totalBooksSum, 0);
 
+  const SortTh = ({ k, children, align = 'left' }: { k: SortKey; children: React.ReactNode; align?: string }) => (
+    <th
+      className={cn(
+        'px-4 py-2.5 text-xs font-semibold cursor-pointer select-none hover:opacity-80 transition-opacity',
+        align === 'right' ? 'text-right' : align === 'center' ? 'text-center' : 'text-left',
+      )}
+      onClick={() => handleSort(k)}
+    >
+      <span className="inline-flex items-center gap-0.5">
+        {children}
+        <SortIcon active={sortKey === k} dir={sortDir} />
+      </span>
+    </th>
+  );
+
   return (
     <Card padding={false}>
-      <div className="px-4 py-3 border-b border-gray-100">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
         <p className="text-xs text-gray-500">
           {groups.length} sections across {totalMatches} matched pairs
         </p>
+        <TableExport
+          headers={['Section', 'Matches', '26AS Amount', 'Books Sum', 'Avg Variance %', 'HIGH', 'MEDIUM', 'LOW']}
+          rows={groups.map((g) => [
+            g.section, String(g.count), String(g.totalAs26Amount), String(g.totalBooksSum),
+            g.avgVariancePct.toFixed(2), String(g.highCount), String(g.mediumCount), String(g.lowCount),
+          ])}
+          filename="section-summary.csv"
+        />
       </div>
 
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-[#1B3A5C] text-white">
-              <th className="text-left px-4 py-2.5 text-xs font-semibold">
-                Section
-              </th>
-              <th className="text-right px-4 py-2.5 text-xs font-semibold">
-                Matches
-              </th>
-              <th className="text-right px-4 py-2.5 text-xs font-semibold">
-                26AS Amount
-              </th>
-              <th className="text-right px-4 py-2.5 text-xs font-semibold">
-                Books Sum
-              </th>
-              <th className="text-right px-4 py-2.5 text-xs font-semibold">
-                Avg Variance
-              </th>
+              <SortTh k="section">Section</SortTh>
+              <SortTh k="count" align="right">Matches</SortTh>
+              <SortTh k="totalAs26Amount" align="right">26AS Amount</SortTh>
+              <SortTh k="totalBooksSum" align="right">Books Sum</SortTh>
+              <SortTh k="avgVariancePct" align="right">Avg Variance</SortTh>
               <th className="text-center px-4 py-2.5 text-xs font-semibold">
                 Confidence Distribution
               </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {groups.map((group) => (
-              <tr key={group.section} className="hover:bg-gray-50 transition-colors">
+            {groups.map((group, idx) => (
+              <tr key={group.section} className={cn('hover:bg-gray-50 transition-colors', idx % 2 === 1 && 'bg-gray-50/30')}>
                 <td className="px-4 py-3">
                   <span className="font-mono text-xs font-semibold text-[#1B3A5C]">
                     {group.section}

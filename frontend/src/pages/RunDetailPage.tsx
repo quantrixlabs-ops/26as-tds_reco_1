@@ -31,11 +31,18 @@ import {
   ArrowUpDown,
   Copy,
   Check,
+  MessageCircle,
+  Send,
+  Edit3,
 } from 'lucide-react';
 import {
   runsApi,
+  settingsApi,
+  authApi,
   type Exception,
   type RunSummary,
+  type RunComment,
+  type User as ApiUser,
 } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useToast } from '../components/ui/Toast';
@@ -63,6 +70,10 @@ import {
   copyToClipboard,
 } from '../lib/utils';
 import { ErrorBoundary } from '../components/ui/ErrorBoundary';
+import { TableSearch } from '../components/ui/TableSearch';
+import { TablePagination } from '../components/ui/TablePagination';
+import { TableExport } from '../components/ui/TableExport';
+import { ColumnToggle } from '../components/ui/ColumnToggle';
 import SectionSummaryTab from '../components/SectionSummaryTab';
 import MismatchTrackerTab from '../components/MismatchTrackerTab';
 import MatchingMethodologyPanel from '../components/MatchingMethodologyPanel';
@@ -115,9 +126,63 @@ function Copyable({ value, label, className, children }: {
 
 // ── Metadata card ─────────────────────────────────────────────────────────────
 
+function ConfigDiffPanel({ runId }: { runId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const { data, isLoading } = useQuery({
+    queryKey: ['config-diff', runId],
+    queryFn: () => runsApi.configDiff(runId),
+  });
+
+  if (isLoading || !data?.has_parent) return null;
+  if (data.diff.length === 0) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-emerald-600 bg-emerald-50 px-3 py-2 rounded-lg">
+        <CheckCircle className="h-3.5 w-3.5" />
+        Rerun — config unchanged from original
+      </div>
+    );
+  }
+
+  return (
+    <div className="border border-amber-200 bg-amber-50 rounded-lg overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-amber-800 hover:bg-amber-100 transition-colors"
+      >
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <span>Rerun — {data.diff.length} config change{data.diff.length !== 1 ? 's' : ''} from original</span>
+        {expanded ? <ChevronDown className="h-3 w-3 ml-auto" /> : <ChevronRight className="h-3 w-3 ml-auto" />}
+      </button>
+      {expanded && (
+        <div className="px-3 pb-2">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-amber-700">
+                <th className="text-left py-1 pr-3">Parameter</th>
+                <th className="text-left py-1 pr-3">Original</th>
+                <th className="text-left py-1">Current</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.diff.map((d) => (
+                <tr key={d.field} className="border-t border-amber-200">
+                  <td className="py-1 pr-3 font-mono text-amber-900">{d.field}</td>
+                  <td className="py-1 pr-3 text-red-700 line-through">{String(d.old_value ?? '—')}</td>
+                  <td className="py-1 text-emerald-700 font-semibold">{String(d.new_value ?? '—')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MetadataCard({ run }: { run: RunSummary }) {
   return (
     <Card>
+      {run.parent_batch_id && <ConfigDiffPanel runId={run.id} />}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-4 text-sm">
         <div>
           <p className="text-xs text-gray-400 mb-0.5">Run Number</p>
@@ -302,12 +367,19 @@ function MatchedTab({ runId }: { runId: string }) {
 
   // Global search
   const [globalSearch, setGlobalSearch] = useState('');
+  // Pagination
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
   // Dropdown filter state
   const [selectedMonths, setSelectedMonths] = useState<Set<string>>(new Set());
   const [selectedSections, setSelectedSections] = useState<Set<string>>(new Set());
   const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set());
   const [selectedConfidence, setSelectedConfidence] = useState<Set<string>>(new Set());
+
+  // Column visibility
+  const allColKeys = ['as26_index', 'as26_date', 'section', 'as26_amount', 'books_sum', 'variance_pct', 'match_type', 'confidence', 'invoice_count'];
+  const [visibleCols, setVisibleCols] = useState<Set<string>>(new Set(allColKeys));
 
 
   // Sort state
@@ -336,6 +408,7 @@ function MatchedTab({ runId }: { runId: string }) {
     setSelectedTypes(new Set());
     setSelectedConfidence(new Set());
     setGlobalSearch('');
+    setPage(1);
   };
 
   // Apply filters
@@ -389,6 +462,8 @@ function MatchedTab({ runId }: { runId: string }) {
       })
     : filtered;
 
+  const paged = sorted.slice((page - 1) * pageSize, page * pageSize);
+
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
       if (sortDir === 'asc') setSortDir('desc');
@@ -410,7 +485,7 @@ function MatchedTab({ runId }: { runId: string }) {
     setExpandedRow(expandedRow === idx ? null : idx);
   };
 
-  const columns: { key: SortKey; label: string; align: 'left' | 'right' }[] = [
+  const allColumns: { key: SortKey; label: string; align: 'left' | 'right' }[] = [
     { key: 'as26_index', label: '26AS #', align: 'left' },
     { key: 'as26_date', label: 'Date', align: 'left' },
     { key: 'section', label: 'Section', align: 'left' },
@@ -421,31 +496,20 @@ function MatchedTab({ runId }: { runId: string }) {
     { key: 'confidence', label: 'Confidence', align: 'left' },
     { key: 'invoice_count', label: 'Invoices', align: 'left' },
   ];
+  const columns = allColumns.filter((c) => visibleCols.has(c.key));
+  const colCount = columns.length + 1; // +1 for expand chevron
 
   return (
     <Card padding={false}>
       {/* Toolbar: search bar + dropdown filters */}
       <div className="px-4 py-3 border-b border-gray-100 space-y-2.5">
         <div className="flex items-center gap-3">
-          <div className="relative flex-1 max-w-sm">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search all columns..."
-              value={globalSearch}
-              onChange={(e) => setGlobalSearch(e.target.value)}
-              className="w-full pl-8 pr-8 py-1.5 text-xs border border-gray-200 rounded-lg outline-none focus:border-[#1B3A5C] bg-white"
-            />
-            {globalSearch && (
-              <button
-                type="button"
-                onClick={() => setGlobalSearch('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            )}
-          </div>
+          <TableSearch
+            value={globalSearch}
+            onChange={(v) => { setGlobalSearch(v); setPage(1); }}
+            placeholder="Search all columns..."
+            className="flex-1 max-w-sm"
+          />
           <p className="text-xs text-gray-400 shrink-0">
             {activeFilterCount > 0
               ? <>{sorted.length} of {data.length} pairs</>
@@ -462,6 +526,28 @@ function MatchedTab({ runId }: { runId: string }) {
               <X className="h-3 w-3" /> Clear all
             </button>
           )}
+          <TableExport
+            headers={['26AS #', 'Date', 'Section', '26AS Amount', 'Books Sum', 'Variance %', 'Variance Amt', 'Type', 'Confidence', 'Invoices', 'Invoice Refs']}
+            rows={sorted.map((r) => [
+              String(r.as26_index ?? ''),
+              r.as26_date ?? '',
+              r.section ?? '',
+              String(r.as26_amount),
+              String(r.books_sum),
+              String(r.variance_pct),
+              String(r.variance_amt ?? ''),
+              r.match_type,
+              r.confidence,
+              String(r.invoice_count),
+              r.invoice_refs.join('; '),
+            ])}
+            filename="matched-pairs.csv"
+          />
+          <ColumnToggle
+            columns={allColumns.map((c) => ({ key: c.key, label: c.label, locked: c.key === 'as26_amount' }))}
+            visible={visibleCols}
+            onChange={setVisibleCols}
+          />
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <DropdownFilter label="Month" options={monthOptions} selected={selectedMonths} onChange={setSelectedMonths} />
@@ -498,14 +584,14 @@ function MatchedTab({ runId }: { runId: string }) {
             {isLoading ? (
               Array.from({ length: 5 }).map((_, i) => (
                 <tr key={i}>
-                  {Array.from({ length: 10 }).map((_, j) => (
+                  {Array.from({ length: colCount }).map((_, j) => (
                     <td key={j} className="px-4 py-3"><div className="h-4 bg-gray-100 rounded animate-pulse" /></td>
                   ))}
                 </tr>
               ))
             ) : isError ? (
               <tr>
-                <td colSpan={10} className="px-4 py-12 text-center text-sm">
+                <td colSpan={colCount} className="px-4 py-12 text-center text-sm">
                   <div className="flex flex-col items-center gap-2">
                     <AlertTriangle className="h-5 w-5 text-red-400" />
                     <span className="text-red-600 font-medium">Failed to load matched pairs</span>
@@ -515,14 +601,14 @@ function MatchedTab({ runId }: { runId: string }) {
               </tr>
             ) : sorted.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-4 py-12 text-center text-gray-400 text-sm">
+                <td colSpan={colCount} className="px-4 py-12 text-center text-gray-400 text-sm">
                   {activeFilterCount > 0
                     ? 'No matched pairs match your filters'
                     : 'No matched pairs for this run'}
                 </td>
               </tr>
             ) : (
-              sorted.map((r, idx) => (
+              paged.map((r, idx) => (
                 <Fragment key={`matched-${r.id || idx}`}>
                   <tr
                     className="hover:bg-gray-50 transition-colors cursor-pointer"
@@ -533,27 +619,33 @@ function MatchedTab({ runId }: { runId: string }) {
                         ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
                         : <ChevronRight className="h-4 w-4" />}
                     </td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-500">#{r.as26_index ?? idx + 1}</span></td>
-                    <td className="px-4 py-3"><span className="text-xs">{formatDate(r.as26_date)}</span></td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs">{r.section}</span></td>
-                    <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.as26_amount)}</span></td>
-                    <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.books_sum)}</span></td>
-                    <td className="px-4 py-3 text-right">
-                      <span className={cn('font-mono text-xs', r.variance_pct > 3 ? 'text-red-600' : r.variance_pct > 1 ? 'text-amber-600' : 'text-gray-700')}>
-                        {formatPct(r.variance_pct)}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-600">{r.match_type}</span></td>
-                    <td className="px-4 py-3">
-                      <Badge variant={confidenceVariant(r.confidence)} size="sm">{r.confidence}</Badge>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className="text-xs text-gray-500" title={r.invoice_refs.join(', ')}>{r.invoice_count} inv</span>
-                    </td>
+                    {visibleCols.has('as26_index') && <td className="px-4 py-3"><span className="font-mono text-xs text-gray-500">#{r.as26_index ?? idx + 1}</span></td>}
+                    {visibleCols.has('as26_date') && <td className="px-4 py-3"><span className="text-xs">{formatDate(r.as26_date)}</span></td>}
+                    {visibleCols.has('section') && <td className="px-4 py-3"><span className="font-mono text-xs">{r.section}</span></td>}
+                    {visibleCols.has('as26_amount') && <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.as26_amount)}</span></td>}
+                    {visibleCols.has('books_sum') && <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.books_sum)}</span></td>}
+                    {visibleCols.has('variance_pct') && (
+                      <td className="px-4 py-3 text-right">
+                        <span className={cn('font-mono text-xs', r.variance_pct > 3 ? 'text-red-600' : r.variance_pct > 1 ? 'text-amber-600' : 'text-gray-700')}>
+                          {formatPct(r.variance_pct)}
+                        </span>
+                      </td>
+                    )}
+                    {visibleCols.has('match_type') && <td className="px-4 py-3"><span className="font-mono text-xs text-gray-600">{r.match_type}</span></td>}
+                    {visibleCols.has('confidence') && (
+                      <td className="px-4 py-3">
+                        <Badge variant={confidenceVariant(r.confidence)} size="sm">{r.confidence}</Badge>
+                      </td>
+                    )}
+                    {visibleCols.has('invoice_count') && (
+                      <td className="px-4 py-3">
+                        <span className="text-xs text-gray-500" title={r.invoice_refs.join(', ')}>{r.invoice_count} inv</span>
+                      </td>
+                    )}
                   </tr>
                   {expandedRow === idx && (
                     <tr key={`matched-detail-${r.id || idx}`} className="bg-gray-50/70">
-                      <td colSpan={10} className="px-0 py-0">
+                      <td colSpan={colCount} className="px-0 py-0">
                         <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm overflow-hidden">
                           <div className="grid grid-cols-1 lg:grid-cols-3 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-gray-100">
                             {/* Invoice Details */}
@@ -694,6 +786,13 @@ function MatchedTab({ runId }: { runId: string }) {
           </tbody>
         </table>
       </div>
+      {sorted.length > 25 && (
+        <TablePagination
+          page={page} pageSize={pageSize} total={sorted.length}
+          onPageChange={(p) => { setPage(p); setExpandedRow(null); }}
+          onPageSizeChange={(s) => { setPageSize(s); setPage(1); setExpandedRow(null); }}
+        />
+      )}
     </Card>
   );
 }
@@ -705,19 +804,76 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
     queryKey: ['runs', runId, 'unmatched-26as'],
     queryFn: () => runsApi.unmatched26as(runId),
   });
-  const [expandedRow, setExpandedRow] = useState<number | null>(null);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
   const [reasonFilter, setReasonFilter] = useState<string>('');
+  const [search, setSearch] = useState('');
+  const [sortKey, setSortKey] = useState<string>('amount');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
-  const toggleRow = (idx: number) => {
-    setExpandedRow(expandedRow === idx ? null : idx);
+  const handleSort = (key: string) => {
+    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortKey(key); setSortDir('desc'); }
   };
 
   const totalAmount = data.reduce((sum, r) => sum + (r.amount || 0), 0);
   const reasonCodes = [...new Set(data.map((r) => r.reason_code).filter(Boolean))].sort();
-  const filtered = reasonFilter ? data.filter((r) => r.reason_code === reasonFilter) : data;
-  const filteredAmount = filtered.reduce((sum, r) => sum + (r.amount || 0), 0);
+
+  // Filter → Search → Sort → Paginate
+  let processed = reasonFilter ? data.filter((r) => r.reason_code === reasonFilter) : data;
+  if (search) {
+    const q = search.toLowerCase();
+    processed = processed.filter((r) =>
+      (r.deductor_name ?? '').toLowerCase().includes(q)
+      || (r.tan ?? '').toLowerCase().includes(q)
+      || (r.section ?? '').toLowerCase().includes(q)
+      || (r.reason_code ?? '').toLowerCase().includes(q)
+      || String(r.amount).includes(q)
+      || String(r.index).includes(q),
+    );
+  }
+  const filteredAmount = processed.reduce((sum, r) => sum + (r.amount || 0), 0);
+
+  processed = [...processed].sort((a, b) => {
+    let av: string | number | null, bv: string | number | null;
+    switch (sortKey) {
+      case 'index': av = a.index ?? 0; bv = b.index ?? 0; break;
+      case 'deductor_name': av = (a.deductor_name ?? '').toLowerCase(); bv = (b.deductor_name ?? '').toLowerCase(); break;
+      case 'section': av = a.section ?? ''; bv = b.section ?? ''; break;
+      case 'date': av = a.date ?? a.transaction_date ?? ''; bv = b.date ?? b.transaction_date ?? ''; break;
+      case 'amount': av = a.amount ?? 0; bv = b.amount ?? 0; break;
+      case 'reason_code': av = a.reason_code ?? ''; bv = b.reason_code ?? ''; break;
+      default: return 0;
+    }
+    if (typeof av === 'number' && typeof bv === 'number') return sortDir === 'asc' ? av - bv : bv - av;
+    return sortDir === 'asc' ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+  });
+
+  const total = processed.length;
+  const paged = processed.slice((page - 1) * pageSize, page * pageSize);
+
+  // Reset page on filter/search change
+  const resetPage = () => setPage(1);
 
   const [showLegend, setShowLegend] = useState(false);
+
+  const SortTh = ({ k, children, align = 'left' }: { k: string; children: React.ReactNode; align?: string }) => (
+    <th
+      className={cn(
+        'px-4 py-2.5 font-semibold text-[10px] text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-700 hover:bg-gray-100 transition-colors',
+        align === 'right' ? 'text-right' : 'text-left',
+      )}
+      onClick={() => handleSort(k)}
+    >
+      <span className="inline-flex items-center gap-0.5">
+        {children}
+        {sortKey === k
+          ? (sortDir === 'asc' ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />)
+          : <ArrowUpDown className="h-3 w-3 opacity-30" />}
+      </span>
+    </th>
+  );
 
   return (
     <Card padding={false}>
@@ -726,8 +882,8 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
           <div className="flex items-center gap-2">
             <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
             <p className="text-xs text-gray-500">
-              {reasonFilter
-                ? <>{filtered.length} of {data.length} entries · {formatCurrency(filteredAmount)}</>
+              {(reasonFilter || search)
+                ? <>{total} of {data.length} entries · {formatCurrency(filteredAmount)}</>
                 : <>{data.length} unmatched 26AS entries</>}
             </p>
           </div>
@@ -762,41 +918,57 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
             </div>
           </div>
         )}
-        {reasonCodes.length > 1 && (
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-400">Filter by reason:</span>
-            <select
-              value={reasonFilter}
-              onChange={(e) => setReasonFilter(e.target.value)}
-              className="text-xs border border-gray-200 rounded-lg px-2 py-1 outline-none focus:border-[#1B3A5C]"
-            >
-              <option value="">All reason codes</option>
-              {reasonCodes.map((code) => {
-                const count = data.filter((r) => r.reason_code === code).length;
-                return <option key={code} value={code}>{code} ({count})</option>;
-              })}
-            </select>
-            {reasonFilter && (
-              <button onClick={() => setReasonFilter('')} className="text-xs text-red-500 hover:underline">Clear</button>
-            )}
-          </div>
-        )}
+        <div className="flex items-center gap-2 flex-wrap">
+          <TableSearch
+            value={search}
+            onChange={(v) => { setSearch(v); resetPage(); }}
+            placeholder="Search deductor, TAN, section, amount..."
+            className="w-64"
+          />
+          {reasonCodes.length > 1 && (
+            <>
+              <select
+                value={reasonFilter}
+                onChange={(e) => { setReasonFilter(e.target.value); resetPage(); }}
+                className="text-xs border border-gray-200 rounded-lg px-2 py-1.5 outline-none focus:border-[#1B3A5C]"
+              >
+                <option value="">All reason codes</option>
+                {reasonCodes.map((code) => {
+                  const count = data.filter((r) => r.reason_code === code).length;
+                  return <option key={code} value={code}>{code} ({count})</option>;
+                })}
+              </select>
+            </>
+          )}
+          {(reasonFilter || search) && (
+            <button onClick={() => { setReasonFilter(''); setSearch(''); resetPage(); }} className="text-xs text-red-500 hover:underline">Clear all</button>
+          )}
+          <TableExport
+            headers={['#', 'Deductor', 'TAN', 'Section', 'Date', 'Amount', 'Reason Code', 'Reason']}
+            rows={processed.map((r) => [
+              String(r.index ?? ''), r.deductor_name ?? '', r.tan ?? '', r.section ?? '',
+              r.date ?? r.transaction_date ?? '', String(r.amount ?? 0),
+              r.reason_code ?? '', r.reason_label ?? '',
+            ])}
+            filename="unmatched-26as.csv"
+          />
+        </div>
       </div>
       <div className="w-full overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="border-b border-gray-200 bg-gray-50">
+        <table className="w-full text-xs">
+          <thead className="border-b border-gray-200 bg-gray-50 sticky top-0 z-10">
             <tr>
-              <th className="px-2 py-3 w-8" />
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">#</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Deductor</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">TAN</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Section</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Date</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-right whitespace-nowrap">Amount</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Reason</th>
+              <th className="px-2 py-2.5 w-8" />
+              <SortTh k="index">#</SortTh>
+              <SortTh k="deductor_name">Deductor</SortTh>
+              <th className="px-4 py-2.5 font-semibold text-[10px] text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">TAN</th>
+              <SortTh k="section">Section</SortTh>
+              <SortTh k="date">Date</SortTh>
+              <SortTh k="amount" align="right">Amount</SortTh>
+              <SortTh k="reason_code">Reason</SortTh>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
+          <tbody className="divide-y divide-gray-50">
             {isLoading ? (
               Array.from({ length: 5 }).map((_, i) => (
                 <tr key={i}>
@@ -805,81 +977,92 @@ function Unmatched26ASTab({ runId }: { runId: string }) {
                   ))}
                 </tr>
               ))
-            ) : filtered.length === 0 ? (
+            ) : paged.length === 0 ? (
               <tr>
                 <td colSpan={8} className="px-4 py-12 text-center text-gray-400 text-sm">
-                  {reasonFilter ? 'No entries match the selected reason code' : 'All 26AS entries matched'}
+                  {(reasonFilter || search) ? 'No entries match the current filters' : 'All 26AS entries matched'}
                 </td>
               </tr>
             ) : (
-              filtered.map((r, idx) => (
-                <Fragment key={`u26-${idx}`}>
-                  <tr
-                    className="hover:bg-gray-50 transition-colors cursor-pointer"
-                    onClick={() => toggleRow(idx)}
-                  >
-                    <td className="px-2 py-3 text-gray-400">
-                      {expandedRow === idx
-                        ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
-                        : <ChevronRight className="h-4 w-4" />}
-                    </td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-400">#{r.index}</span></td>
-                    <td className="px-4 py-3"><span className="text-sm">{truncate(r.deductor_name, 30)}</span></td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs">{r.tan}</span></td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs">{r.section}</span></td>
-                    <td className="px-4 py-3"><span className="text-xs">{formatDate(r.date ?? r.transaction_date)}</span></td>
-                    <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.amount)}</span></td>
-                    <td className="px-4 py-3">
-                      <div>
-                        <span className="font-mono text-xs text-red-600">{r.reason_code}</span>
-                        <p className="text-xs text-gray-400">{r.reason_label}</p>
-                      </div>
-                    </td>
-                  </tr>
-                  {expandedRow === idx && (
-                    <tr key={`u26-detail-${idx}`} className="bg-gray-50/70">
-                      <td colSpan={8} className="px-0 py-0">
-                        <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm p-4">
-                          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Full Deductor Name</p>
-                              <p className="text-sm font-medium text-gray-900">{r.deductor_name}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">TAN</p>
-                              <p className="font-mono text-sm text-gray-800">{r.tan}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Section</p>
-                              <p className="font-mono text-sm text-gray-800">{r.section}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Amount</p>
-                              <p className="font-mono text-sm font-semibold text-[#1B3A5C]">{formatCurrency(r.amount)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Transaction Date</p>
-                              <p className="text-sm text-gray-800">{formatDate(r.date ?? r.transaction_date) || '--'}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Reason Code</p>
-                              <p className="font-mono text-sm font-semibold text-red-600">{r.reason_code}</p>
-                            </div>
-                            <div className="col-span-2">
-                              <p className="text-xs text-gray-400 mb-0.5">Reason Detail</p>
-                              <p className="text-sm text-gray-700">{r.reason_detail || r.reason_label || '--'}</p>
-                            </div>
-                          </div>
+              paged.map((r, idx) => {
+                const rowKey = `u26-${r.index ?? idx}`;
+                const isExpanded = expandedRow === rowKey;
+                return (
+                  <Fragment key={rowKey}>
+                    <tr
+                      className={cn('hover:bg-gray-50 transition-colors cursor-pointer', idx % 2 === 1 && 'bg-gray-50/30')}
+                      onClick={() => setExpandedRow(isExpanded ? null : rowKey)}
+                    >
+                      <td className="px-2 py-2.5 text-gray-400">
+                        {isExpanded
+                          ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
+                          : <ChevronRight className="h-4 w-4" />}
+                      </td>
+                      <td className="px-4 py-2.5"><span className="font-mono text-gray-400">#{r.index}</span></td>
+                      <td className="px-4 py-2.5" title={r.deductor_name}><span>{truncate(r.deductor_name, 30)}</span></td>
+                      <td className="px-4 py-2.5"><span className="font-mono">{r.tan}</span></td>
+                      <td className="px-4 py-2.5"><span className="font-mono">{r.section}</span></td>
+                      <td className="px-4 py-2.5">{formatDate(r.date ?? r.transaction_date)}</td>
+                      <td className="px-4 py-2.5 text-right"><span className="font-mono font-semibold">{formatCurrency(r.amount)}</span></td>
+                      <td className="px-4 py-2.5">
+                        <div>
+                          <span className="font-mono text-red-600 font-semibold">{r.reason_code}</span>
+                          <p className="text-gray-400">{r.reason_label}</p>
                         </div>
                       </td>
                     </tr>
-                  )}
-                </Fragment>
-              ))
+                    {isExpanded && (
+                      <tr className="bg-gray-50/70">
+                        <td colSpan={8} className="px-0 py-0">
+                          <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm p-4">
+                            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Full Deductor Name</p>
+                                <p className="text-sm font-medium text-gray-900">{r.deductor_name}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">TAN</p>
+                                <p className="font-mono text-sm text-gray-800">{r.tan}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Section</p>
+                                <p className="font-mono text-sm text-gray-800">{r.section}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Amount</p>
+                                <p className="font-mono text-sm font-semibold text-[#1B3A5C]">{formatCurrency(r.amount)}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Transaction Date</p>
+                                <p className="text-sm text-gray-800">{formatDate(r.date ?? r.transaction_date) || '--'}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Reason Code</p>
+                                <p className="font-mono text-sm font-semibold text-red-600">{r.reason_code}</p>
+                              </div>
+                              <div className="col-span-2">
+                                <p className="text-xs text-gray-400 mb-0.5">Reason Detail</p>
+                                <p className="text-sm text-gray-700">{r.reason_detail || r.reason_label || '--'}</p>
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })
             )}
           </tbody>
         </table>
       </div>
+      {total > 25 && (
+        <TablePagination
+          page={page} pageSize={pageSize} total={total}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => { setPageSize(s); setPage(1); }}
+        />
+      )}
     </Card>
   );
 }
@@ -891,31 +1074,130 @@ function UnmatchedBooksTab({ runId }: { runId: string }) {
     queryKey: ['runs', runId, 'unmatched-books'],
     queryFn: () => runsApi.unmatchedBooks(runId),
   });
-  const [expandedRow, setExpandedRow] = useState<number | null>(null);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [docTypeFilter, setDocTypeFilter] = useState('');
+  const [sortKey, setSortKey] = useState<string>('amount');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
-  const toggleRow = (idx: number) => {
-    setExpandedRow(expandedRow === idx ? null : idx);
+  const handleSort = (key: string) => {
+    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortKey(key); setSortDir('desc'); }
   };
+
+  const docTypes = [...new Set(data.map((r) => r.doc_type).filter(Boolean))].sort();
+  const totalAmount = data.reduce((sum, r) => sum + (r.amount || 0), 0);
+
+  // Filter → Search → Sort → Paginate
+  let processed = docTypeFilter ? data.filter((r) => r.doc_type === docTypeFilter) : data;
+  if (search) {
+    const q = search.toLowerCase();
+    processed = processed.filter((r) =>
+      (r.invoice_ref ?? '').toLowerCase().includes(q)
+      || (r.clearing_doc ?? '').toLowerCase().includes(q)
+      || (r.doc_type ?? '').toLowerCase().includes(q)
+      || (r.sgl_flag ?? '').toLowerCase().includes(q)
+      || String(r.amount).includes(q),
+    );
+  }
+
+  processed = [...processed].sort((a, b) => {
+    let av: string | number | null, bv: string | number | null;
+    switch (sortKey) {
+      case 'invoice_ref': av = (a.invoice_ref ?? '').toLowerCase(); bv = (b.invoice_ref ?? '').toLowerCase(); break;
+      case 'clearing_doc': av = a.clearing_doc ?? ''; bv = b.clearing_doc ?? ''; break;
+      case 'doc_date': av = a.doc_date ?? ''; bv = b.doc_date ?? ''; break;
+      case 'amount': av = a.amount ?? 0; bv = b.amount ?? 0; break;
+      case 'doc_type': av = a.doc_type ?? ''; bv = b.doc_type ?? ''; break;
+      default: return 0;
+    }
+    if (typeof av === 'number' && typeof bv === 'number') return sortDir === 'asc' ? av - bv : bv - av;
+    return sortDir === 'asc' ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+  });
+
+  const total = processed.length;
+  const paged = processed.slice((page - 1) * pageSize, page * pageSize);
+  const resetPage = () => setPage(1);
+
+  const SortTh = ({ k, children, align = 'left' }: { k: string; children: React.ReactNode; align?: string }) => (
+    <th
+      className={cn(
+        'px-4 py-2.5 font-semibold text-[10px] text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-700 hover:bg-gray-100 transition-colors',
+        align === 'right' ? 'text-right' : 'text-left',
+      )}
+      onClick={() => handleSort(k)}
+    >
+      <span className="inline-flex items-center gap-0.5">
+        {children}
+        {sortKey === k
+          ? (sortDir === 'asc' ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />)
+          : <ArrowUpDown className="h-3 w-3 opacity-30" />}
+      </span>
+    </th>
+  );
 
   return (
     <Card padding={false}>
-      <div className="px-4 py-3 border-b border-gray-100">
-        <p className="text-xs text-gray-500">{data.length} unmatched SAP book entries</p>
+      <div className="px-4 py-3 border-b border-gray-100 space-y-2">
+        <div className="flex items-center justify-between gap-4">
+          <p className="text-xs text-gray-500">
+            {(search || docTypeFilter) ? `${total} of ${data.length}` : data.length} unmatched SAP book entries
+          </p>
+          {data.length > 0 && (
+            <p className="text-xs text-gray-500">
+              Total: <span className="font-mono font-semibold text-gray-700">{formatCurrency(totalAmount)}</span>
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <TableSearch
+            value={search}
+            onChange={(v) => { setSearch(v); resetPage(); }}
+            placeholder="Search invoice, clearing doc, amount..."
+            className="w-64"
+          />
+          {docTypes.length > 1 && (
+            <select
+              value={docTypeFilter}
+              onChange={(e) => { setDocTypeFilter(e.target.value); resetPage(); }}
+              className="text-xs border border-gray-200 rounded-lg px-2 py-1.5 outline-none focus:border-[#1B3A5C]"
+            >
+              <option value="">All doc types</option>
+              {docTypes.map((dt) => {
+                const count = data.filter((r) => r.doc_type === dt).length;
+                return <option key={dt} value={dt}>{dt} ({count})</option>;
+              })}
+            </select>
+          )}
+          {(search || docTypeFilter) && (
+            <button onClick={() => { setSearch(''); setDocTypeFilter(''); resetPage(); }} className="text-xs text-red-500 hover:underline">Clear all</button>
+          )}
+          <TableExport
+            headers={['Invoice Ref', 'Clearing Doc', 'Doc Date', 'Amount', 'Doc Type', 'SGL Flag']}
+            rows={processed.map((r) => [
+              r.invoice_ref ?? '', r.clearing_doc ?? '', r.doc_date ?? '',
+              String(r.amount ?? 0), r.doc_type ?? '', r.sgl_flag ?? '',
+            ])}
+            filename="unmatched-books.csv"
+          />
+        </div>
       </div>
       <div className="w-full overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="border-b border-gray-200 bg-gray-50">
+        <table className="w-full text-xs">
+          <thead className="border-b border-gray-200 bg-gray-50 sticky top-0 z-10">
             <tr>
-              <th className="px-2 py-3 w-8" />
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Invoice Ref</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Clearing Doc</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Doc Date</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-right whitespace-nowrap">Amount</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">Doc Type</th>
-              <th className="px-4 py-3 font-semibold text-xs text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">SGL Flag</th>
+              <th className="px-2 py-2.5 w-8" />
+              <SortTh k="invoice_ref">Invoice Ref</SortTh>
+              <SortTh k="clearing_doc">Clearing Doc</SortTh>
+              <SortTh k="doc_date">Doc Date</SortTh>
+              <SortTh k="amount" align="right">Amount</SortTh>
+              <SortTh k="doc_type">Doc Type</SortTh>
+              <th className="px-4 py-2.5 font-semibold text-[10px] text-gray-500 uppercase tracking-wider text-left whitespace-nowrap">SGL Flag</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
+          <tbody className="divide-y divide-gray-50">
             {isLoading ? (
               Array.from({ length: 5 }).map((_, i) => (
                 <tr key={i}>
@@ -924,75 +1206,88 @@ function UnmatchedBooksTab({ runId }: { runId: string }) {
                   ))}
                 </tr>
               ))
-            ) : data.length === 0 ? (
+            ) : paged.length === 0 ? (
               <tr>
-                <td colSpan={7} className="px-4 py-12 text-center text-gray-400 text-sm">No unmatched book entries</td>
+                <td colSpan={7} className="px-4 py-12 text-center text-gray-400 text-sm">
+                  {(search || docTypeFilter) ? 'No entries match the current filters' : 'No unmatched book entries'}
+                </td>
               </tr>
             ) : (
-              data.map((r, idx) => (
-                <Fragment key={`ub-${idx}`}>
-                  <tr
-                    className="hover:bg-gray-50 transition-colors cursor-pointer"
-                    onClick={() => toggleRow(idx)}
-                  >
-                    <td className="px-2 py-3 text-gray-400">
-                      {expandedRow === idx
-                        ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
-                        : <ChevronRight className="h-4 w-4" />}
-                    </td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs">{truncate(r.invoice_ref, 24)}</span></td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs text-gray-500">{r.clearing_doc}</span></td>
-                    <td className="px-4 py-3"><span className="text-xs">{formatDate(r.doc_date)}</span></td>
-                    <td className="px-4 py-3 text-right"><span className="font-mono text-xs">{formatCurrency(r.amount)}</span></td>
-                    <td className="px-4 py-3"><span className="font-mono text-xs">{r.doc_type}</span></td>
-                    <td className="px-4 py-3">
-                      {r.sgl_flag
-                        ? <Badge variant="yellow" size="sm">{r.sgl_flag}</Badge>
-                        : <span className="text-xs text-gray-300">—</span>}
-                    </td>
-                  </tr>
-                  {expandedRow === idx && (
-                    <tr key={`ub-detail-${idx}`} className="bg-gray-50/70">
-                      <td colSpan={7} className="px-0 py-0">
-                        <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm p-4">
-                          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Full Invoice Ref</p>
-                              <p className="font-mono text-sm font-medium text-gray-900 break-all">{r.invoice_ref}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Clearing Document</p>
-                              <p className="font-mono text-sm text-gray-800">{r.clearing_doc || '--'}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Amount</p>
-                              <p className="font-mono text-sm font-semibold text-[#1B3A5C]">{formatCurrency(r.amount)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Document Type</p>
-                              <p className="font-mono text-sm text-gray-800">{r.doc_type || '--'}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">Document Date</p>
-                              <p className="text-sm text-gray-800">{formatDate(r.doc_date) || '--'}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-400 mb-0.5">SGL Flag</p>
-                              {r.sgl_flag
-                                ? <Badge variant="yellow" size="sm">{r.sgl_flag}</Badge>
-                                : <p className="text-sm text-gray-400">None</p>}
-                            </div>
-                          </div>
-                        </div>
+              paged.map((r, idx) => {
+                const rowKey = `ub-${r.invoice_ref}-${r.amount}-${idx}`;
+                const isExpanded = expandedRow === rowKey;
+                return (
+                  <Fragment key={rowKey}>
+                    <tr
+                      className={cn('hover:bg-gray-50 transition-colors cursor-pointer', idx % 2 === 1 && 'bg-gray-50/30')}
+                      onClick={() => setExpandedRow(isExpanded ? null : rowKey)}
+                    >
+                      <td className="px-2 py-2.5 text-gray-400">
+                        {isExpanded
+                          ? <ChevronDown className="h-4 w-4 text-[#1B3A5C]" />
+                          : <ChevronRight className="h-4 w-4" />}
+                      </td>
+                      <td className="px-4 py-2.5" title={r.invoice_ref}><span className="font-mono">{truncate(r.invoice_ref, 24)}</span></td>
+                      <td className="px-4 py-2.5"><span className="font-mono text-gray-500">{r.clearing_doc || '—'}</span></td>
+                      <td className="px-4 py-2.5">{formatDate(r.doc_date)}</td>
+                      <td className="px-4 py-2.5 text-right"><span className="font-mono font-semibold">{formatCurrency(r.amount)}</span></td>
+                      <td className="px-4 py-2.5"><span className="font-mono">{r.doc_type}</span></td>
+                      <td className="px-4 py-2.5">
+                        {r.sgl_flag
+                          ? <Badge variant="yellow" size="sm">{r.sgl_flag}</Badge>
+                          : <span className="text-gray-300">—</span>}
                       </td>
                     </tr>
-                  )}
-                </Fragment>
-              ))
+                    {isExpanded && (
+                      <tr className="bg-gray-50/70">
+                        <td colSpan={7} className="px-0 py-0">
+                          <div className="border-l-4 border-[#1B3A5C] mx-4 my-3 bg-white rounded-lg shadow-sm p-4">
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Full Invoice Ref</p>
+                                <p className="font-mono text-sm font-medium text-gray-900 break-all">{r.invoice_ref}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Clearing Document</p>
+                                <p className="font-mono text-sm text-gray-800">{r.clearing_doc || '--'}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Amount</p>
+                                <p className="font-mono text-sm font-semibold text-[#1B3A5C]">{formatCurrency(r.amount)}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Document Type</p>
+                                <p className="font-mono text-sm text-gray-800">{r.doc_type || '--'}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">Document Date</p>
+                                <p className="text-sm text-gray-800">{formatDate(r.doc_date) || '--'}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-400 mb-0.5">SGL Flag</p>
+                                {r.sgl_flag
+                                  ? <Badge variant="yellow" size="sm">{r.sgl_flag}</Badge>
+                                  : <p className="text-sm text-gray-400">None</p>}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })
             )}
           </tbody>
         </table>
       </div>
+      {total > 25 && (
+        <TablePagination
+          page={page} pageSize={pageSize} total={total}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => { setPageSize(s); setPage(1); }}
+        />
+      )}
     </Card>
   );
 }
@@ -1018,6 +1313,7 @@ function ExceptionsTab({ runId, canReview }: { runId: string; canReview: boolean
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkAction, setBulkAction] = useState('ACKNOWLEDGED');
   const [bulkProcessing, setBulkProcessing] = useState(false);
+  const [excSearch, setExcSearch] = useState('');
 
   const reviewMut = useMutation({
     mutationFn: ({ id, action, notes }: { id: string; action: string; notes: string }) =>
@@ -1044,6 +1340,15 @@ function ExceptionsTab({ runId, canReview }: { runId: string; canReview: boolean
   if (catFilter) filtered = filtered.filter((e) => e.category === catFilter);
   if (statusFilter === 'pending') filtered = filtered.filter((e) => !e.reviewed);
   if (statusFilter === 'reviewed') filtered = filtered.filter((e) => e.reviewed);
+  if (excSearch) {
+    const q = excSearch.toLowerCase();
+    filtered = filtered.filter((e) =>
+      (e.description ?? '').toLowerCase().includes(q)
+      || (e.category ?? '').toLowerCase().includes(q)
+      || (e.severity ?? '').toLowerCase().includes(q)
+      || String(e.amount ?? '').includes(q),
+    );
+  }
 
   const unreviewed = data.filter((e) => !e.reviewed).length;
 
@@ -1225,6 +1530,12 @@ function ExceptionsTab({ runId, canReview }: { runId: string; canReview: boolean
           )}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <TableSearch
+            value={excSearch}
+            onChange={setExcSearch}
+            placeholder="Search description, category, amount..."
+            className="w-56"
+          />
           <select
             value={sevFilter}
             onChange={(e) => setSevFilter(e.target.value)}
@@ -1258,14 +1569,22 @@ function ExceptionsTab({ runId, canReview }: { runId: string; canReview: boolean
               Select all pending
             </button>
           )}
-          {(sevFilter || catFilter || statusFilter) && (
+          {(sevFilter || catFilter || statusFilter || excSearch) && (
             <button
-              onClick={() => { setSevFilter(''); setCatFilter(''); setStatusFilter(''); }}
+              onClick={() => { setSevFilter(''); setCatFilter(''); setStatusFilter(''); setExcSearch(''); }}
               className="text-xs text-red-500 hover:underline"
             >
-              Clear filters
+              Clear all
             </button>
           )}
+          <TableExport
+            headers={['Severity', 'Category', 'Description', 'Amount', 'Status']}
+            rows={filtered.map((e) => [
+              e.severity, e.category, e.description,
+              e.amount != null ? String(e.amount) : '', e.reviewed ? 'Reviewed' : 'Pending',
+            ])}
+            filename="exceptions.csv"
+          />
         </div>
       </div>
       <Table
@@ -1347,6 +1666,203 @@ function AuditTrailTab({ runId, runStatus }: { runId: string; runStatus?: string
   );
 }
 
+// ── Comments tab (Phase 4B) ──────────────────────────────────────────────────
+
+function CommentsTab({ runId }: { runId: string }) {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [newComment, setNewComment] = useState('');
+  const [replyTo, setReplyTo] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editContent, setEditContent] = useState('');
+
+  const { data: comments = [], isLoading } = useQuery({
+    queryKey: ['runs', runId, 'comments'],
+    queryFn: () => runsApi.comments(runId),
+  });
+
+  const addMut = useMutation({
+    mutationFn: (data: { content: string; parentId?: string }) =>
+      runsApi.addComment(runId, data.content, data.parentId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['runs', runId, 'comments'] });
+      setNewComment('');
+      setReplyTo(null);
+    },
+    onError: (err) => toast('Error', getErrorMessage(err), 'error'),
+  });
+
+  const updateMut = useMutation({
+    mutationFn: (data: { id: string; content: string }) =>
+      runsApi.updateComment(runId, data.id, data.content),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['runs', runId, 'comments'] });
+      setEditingId(null);
+      setEditContent('');
+    },
+    onError: (err) => toast('Error', getErrorMessage(err), 'error'),
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (commentId: string) => runsApi.deleteComment(runId, commentId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['runs', runId, 'comments'] });
+    },
+    onError: (err) => toast('Error', getErrorMessage(err), 'error'),
+  });
+
+  if (isLoading) return <FullPageSpinner />;
+
+  // Build threaded structure: top-level comments + replies
+  const topLevel = comments.filter((c: RunComment) => !c.parent_id);
+  const repliesMap = new Map<string, RunComment[]>();
+  comments.forEach((c: RunComment) => {
+    if (c.parent_id) {
+      const arr = repliesMap.get(c.parent_id) || [];
+      arr.push(c);
+      repliesMap.set(c.parent_id, arr);
+    }
+  });
+
+  const renderComment = (c: RunComment, isReply = false) => (
+    <div key={c.id} className={cn('flex gap-3', isReply && 'ml-8 mt-2')}>
+      <div className="w-8 h-8 rounded-full bg-[#1B3A5C]/10 flex items-center justify-center text-xs font-bold text-[#1B3A5C] shrink-0">
+        {(c.user_name || '?')[0].toUpperCase()}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-gray-900">{c.user_name}</span>
+          {c.user_role && <Badge variant="gray" size="sm">{c.user_role}</Badge>}
+          <span className="text-xs text-gray-400">{c.created_at ? formatDateTime(c.created_at) : ''}</span>
+          {c.updated_at && c.updated_at !== c.created_at && (
+            <span className="text-xs text-gray-400 italic">(edited)</span>
+          )}
+        </div>
+        {editingId === c.id ? (
+          <div className="mt-1 flex gap-2">
+            <input
+              value={editContent}
+              onChange={(e) => setEditContent(e.target.value)}
+              className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-[#1B3A5C]/20 focus:border-[#1B3A5C] outline-none"
+            />
+            <button
+              onClick={() => updateMut.mutate({ id: c.id, content: editContent })}
+              disabled={!editContent.trim() || updateMut.isPending}
+              className="px-3 py-1.5 text-xs font-semibold bg-[#1B3A5C] text-white rounded-lg hover:bg-[#15304d] disabled:opacity-50"
+            >
+              Save
+            </button>
+            <button
+              onClick={() => { setEditingId(null); setEditContent(''); }}
+              className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-700"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <p className="text-sm text-gray-700 mt-0.5">{c.content}</p>
+        )}
+        <div className="flex items-center gap-3 mt-1">
+          {!isReply && (
+            <button
+              onClick={() => setReplyTo(replyTo === c.id ? null : c.id)}
+              className="text-xs text-gray-400 hover:text-[#1B3A5C] flex items-center gap-1"
+            >
+              <MessageCircle className="h-3 w-3" />
+              Reply
+            </button>
+          )}
+          {c.user_id === user?.id && (
+            <>
+              <button
+                onClick={() => { setEditingId(c.id); setEditContent(c.content); }}
+                className="text-xs text-gray-400 hover:text-[#1B3A5C] flex items-center gap-1"
+              >
+                <Edit3 className="h-3 w-3" />
+                Edit
+              </button>
+              <button
+                onClick={() => deleteMut.mutate(c.id)}
+                className="text-xs text-gray-400 hover:text-red-500 flex items-center gap-1"
+              >
+                <Trash2 className="h-3 w-3" />
+                Delete
+              </button>
+            </>
+          )}
+        </div>
+        {/* Inline reply input */}
+        {replyTo === c.id && (
+          <div className="mt-2 flex gap-2">
+            <input
+              value={newComment}
+              onChange={(e) => setNewComment(e.target.value)}
+              placeholder="Write a reply..."
+              className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-[#1B3A5C]/20 focus:border-[#1B3A5C] outline-none"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && newComment.trim()) {
+                  addMut.mutate({ content: newComment, parentId: c.id });
+                }
+              }}
+            />
+            <button
+              onClick={() => addMut.mutate({ content: newComment, parentId: c.id })}
+              disabled={!newComment.trim() || addMut.isPending}
+              className="px-3 py-1.5 text-xs font-semibold bg-[#1B3A5C] text-white rounded-lg hover:bg-[#15304d] disabled:opacity-50"
+            >
+              <Send className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+        {/* Replies */}
+        {(repliesMap.get(c.id) || []).map((r: RunComment) => renderComment(r, true))}
+      </div>
+    </div>
+  );
+
+  return (
+    <Card>
+      {/* New top-level comment */}
+      <div className="flex gap-3 mb-6 pb-4 border-b border-gray-100">
+        <div className="w-8 h-8 rounded-full bg-[#1B3A5C]/10 flex items-center justify-center text-xs font-bold text-[#1B3A5C] shrink-0">
+          {(user?.full_name || '?')[0].toUpperCase()}
+        </div>
+        <div className="flex-1 flex gap-2">
+          <input
+            value={replyTo ? '' : newComment}
+            onChange={(e) => { setReplyTo(null); setNewComment(e.target.value); }}
+            placeholder="Add a comment..."
+            className="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-[#1B3A5C]/20 focus:border-[#1B3A5C] outline-none"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && newComment.trim() && !replyTo) {
+                addMut.mutate({ content: newComment });
+              }
+            }}
+          />
+          <button
+            onClick={() => addMut.mutate({ content: newComment })}
+            disabled={!newComment.trim() || addMut.isPending || !!replyTo}
+            className="flex items-center gap-1.5 px-4 py-2 text-sm font-semibold bg-[#1B3A5C] text-white rounded-lg hover:bg-[#15304d] disabled:opacity-50 transition-colors"
+          >
+            <Send className="h-3.5 w-3.5" />
+            Post
+          </button>
+        </div>
+      </div>
+
+      {/* Comment list */}
+      {topLevel.length === 0 ? (
+        <p className="text-sm text-gray-400 text-center py-8">No comments yet. Start the conversation.</p>
+      ) : (
+        <div className="space-y-4">
+          {topLevel.map((c: RunComment) => renderComment(c))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function RunDetailPage() {
@@ -1388,6 +1904,31 @@ export default function RunDetailPage() {
     queryKey: ['runs', id, 'audit'],
     queryFn: () => runsApi.auditTrail(id!),
     enabled: !!run && run.status !== 'PROCESSING',
+  });
+
+  // Fetch admin settings for workflow flags
+  const { data: adminSettings } = useQuery({
+    queryKey: ['admin-settings'],
+    queryFn: settingsApi.get,
+  });
+  const approvalWorkflowEnabled = adminSettings?.approval_workflow_enabled ?? true;
+  const reviewerAssignmentEnabled = adminSettings?.reviewer_assignment_enabled ?? false;
+
+  // Fetch users for reviewer assignment dropdown
+  const { data: allUsers = [] } = useQuery({
+    queryKey: ['users'],
+    queryFn: authApi.users,
+    enabled: reviewerAssignmentEnabled,
+  });
+  const reviewers = allUsers.filter((u: ApiUser) => u.role === 'REVIEWER' || u.role === 'ADMIN');
+
+  const assignMut = useMutation({
+    mutationFn: (reviewerId: string | null) => runsApi.assignReviewer(id!, reviewerId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['runs', id] });
+      toast('Reviewer updated', undefined, 'success');
+    },
+    onError: (err) => toast('Assignment failed', getErrorMessage(err), 'error'),
   });
 
   const isAutoApprovedBelowThreshold =
@@ -1433,10 +1974,14 @@ export default function RunDetailPage() {
 
   const rerunMut = useMutation({
     mutationFn: () => runsApi.rerun(id!),
-    onSuccess: (data) => {
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['runs'] });
-      toast('Re-run started', `New run #${data.run_number} created`, 'success');
-      navigate(`/runs/${data.run_id}`);
+      qc.invalidateQueries({ queryKey: ['runs', id] });
+      qc.invalidateQueries({ queryKey: ['runs', id, 'matched'] });
+      qc.invalidateQueries({ queryKey: ['runs', id, 'unmatched-26as'] });
+      qc.invalidateQueries({ queryKey: ['runs', id, 'unmatched-books'] });
+      qc.invalidateQueries({ queryKey: ['runs', id, 'exceptions'] });
+      toast('Re-run started', 'Reconciliation is re-processing with current settings', 'success');
     },
     onError: (err) => toast('Re-run failed', getErrorMessage(err), 'error'),
   });
@@ -1486,6 +2031,7 @@ export default function RunDetailPage() {
   }
 
   const canReview =
+    approvalWorkflowEnabled &&
     (user?.role === 'REVIEWER' || user?.role === 'ADMIN') &&
     run.status === 'PENDING_REVIEW' &&
     run.created_by !== user?.id;
@@ -1509,6 +2055,11 @@ export default function RunDetailPage() {
               <Badge variant={runStatusVariant(run.status)}>
                 {runStatusLabel(run.status)}
               </Badge>
+              {!approvalWorkflowEnabled && run.status === 'APPROVED' && (
+                <Badge variant="blue" size="sm">
+                  Workflow disabled — auto-approved
+                </Badge>
+              )}
               {isAutoApprovedBelowThreshold && (
                 <Badge variant="orange" size="sm">
                   Auto-approved below 75% threshold
@@ -1522,6 +2073,22 @@ export default function RunDetailPage() {
             </div>
             <p className="text-sm text-gray-500 mt-0.5">
               {run.deductor_name} · {run.tan} · {formatFY(run.financial_year)}
+              {reviewerAssignmentEnabled && run.status === 'PENDING_REVIEW' && (
+                <span className="ml-3 inline-flex items-center gap-1.5">
+                  <span className="text-xs text-gray-400">Reviewer:</span>
+                  <select
+                    value={run.assigned_reviewer_id || ''}
+                    onChange={(e) => assignMut.mutate(e.target.value || null)}
+                    className="text-xs border border-gray-200 rounded px-2 py-0.5 focus:ring-1 focus:ring-[#1B3A5C]/20 outline-none"
+                    disabled={assignMut.isPending}
+                  >
+                    <option value="">Unassigned</option>
+                    {reviewers.map((u: ApiUser) => (
+                      <option key={u.id} value={u.id}>{u.full_name}</option>
+                    ))}
+                  </select>
+                </span>
+              )}
             </p>
           </div>
         </div>
@@ -1590,6 +2157,24 @@ export default function RunDetailPage() {
             </button>
           )}
 
+          {/* Compliance Report (Phase 4F) */}
+          {adminSettings?.compliance_report_enabled && run.status !== 'PROCESSING' && run.status !== 'FAILED' && (
+            <button
+              onClick={async () => {
+                try {
+                  await runsApi.downloadComplianceReport(run.id);
+                  toast('Compliance report downloaded', undefined, 'success');
+                } catch (err) {
+                  toast('Download failed', getErrorMessage(err), 'error');
+                }
+              }}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-emerald-200 text-emerald-700 text-sm font-medium hover:bg-emerald-50 transition-colors"
+            >
+              <FileText className="h-4 w-4" />
+              Compliance
+            </button>
+          )}
+
           {/* Reviewer actions */}
           {canReview && (
             <>
@@ -1632,7 +2217,7 @@ export default function RunDetailPage() {
         onClose={() => setConfirmRerun(false)}
         onConfirm={() => { setConfirmRerun(false); rerunMut.mutate(); }}
         title={`Re-run #${run.run_number}?`}
-        description={`A new reconciliation for ${run.deductor_name} will be created using the same files and settings. The original run will not be modified.`}
+        description={`The reconciliation for ${run.deductor_name || 'this party'} will be re-processed using the same files but current settings. Existing results will be replaced.`}
         confirmLabel="Re-run reconciliation"
         variant="info"
         loading={rerunMut.isPending}
@@ -1855,6 +2440,7 @@ export default function RunDetailPage() {
             { value: 'exceptions', label: 'Exceptions', icon: <ClipboardList className="h-3.5 w-3.5" />,
               count: exceptions.length, badgeColor: exceptionsHighCount > 0 ? 'bg-red-100 text-red-700' : undefined },
             { value: 'audit', label: 'Audit Trail', icon: <Activity className="h-3.5 w-3.5" /> },
+            ...(adminSettings?.comment_threads_enabled !== false ? [{ value: 'comments', label: 'Comments', icon: <MessageCircle className="h-3.5 w-3.5" /> }] : []),
           ].map((t) => (
             <TabsPrimitive.Trigger
               key={t.value}
@@ -1928,6 +2514,11 @@ export default function RunDetailPage() {
         <TabsPrimitive.Content value="audit">
           <AuditTrailTab runId={id!} runStatus={run.status} />
         </TabsPrimitive.Content>
+        {adminSettings?.comment_threads_enabled !== false && (
+          <TabsPrimitive.Content value="comments">
+            <CommentsTab runId={id!} />
+          </TabsPrimitive.Content>
+        )}
       </TabsPrimitive.Root>
     </PageWrapper>
   );

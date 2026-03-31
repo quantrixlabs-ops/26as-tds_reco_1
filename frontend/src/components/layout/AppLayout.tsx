@@ -8,6 +8,7 @@ import {
   FolderOpen,
   PlusCircle,
   ShieldCheck,
+  BookOpen,
   LogOut,
   Menu,
   X,
@@ -42,6 +43,11 @@ const navItems: NavItem[] = [
     to: '/runs/new',
     label: 'New Run',
     icon: <PlusCircle className="h-4 w-4" />,
+  },
+  {
+    to: '/docs',
+    label: 'Documentation',
+    icon: <BookOpen className="h-4 w-4" />,
   },
   {
     to: '/admin',

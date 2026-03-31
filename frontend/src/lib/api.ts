@@ -190,12 +190,18 @@ export interface RunSummary {
   completed_at: string | null;
   mode: 'SINGLE' | 'BATCH';
   batch_id: string | null;
+  batch_name: string | null;
+  batch_tags: string[] | null;
+  parent_batch_id: string | null;
   created_by?: string;
   // Amount totals
   total_26as_amount: number;
   total_sap_amount?: number;
   matched_amount: number;
   unmatched_26as_amount: number;
+  // Phase 4 fields
+  assigned_reviewer_id?: string | null;
+  archived?: boolean;
 }
 
 export interface ScoreBreakdown {
@@ -350,6 +356,138 @@ export interface AdminSettings {
   clearing_group_enabled: boolean;
   clearing_group_variance_pct: number | null;
   proxy_clearing_enabled: boolean;
+  // Batch Processing (Phase 1)
+  batch_concurrency_limit: number;
+  batch_parse_cache_enabled: boolean;
+  batch_invoice_dedup_enabled: boolean;
+  batch_control_total_enabled: boolean;
+  // Batch Processing (Phase 2)
+  batch_auto_retry_count: number;
+  batch_duplicate_detection_enabled: boolean;
+  batch_progress_dashboard_enabled: boolean;
+  batch_comparison_enabled: boolean;
+  batch_variance_trend_enabled: boolean;
+  batch_export_template: string;
+  batch_notification_enabled: boolean;
+  batch_notification_webhook_url: string | null;
+  batch_scheduling_enabled: boolean;
+  // Reconciliation Intelligence (Phase 3)
+  section_filter_enabled: boolean;
+  invoice_date_proximity_enabled: boolean;
+  max_date_gap_days: number;
+  as26_duplicate_check_enabled: boolean;
+  credit_note_handling_enabled: boolean;
+  bipartite_matching_enabled: boolean;
+  enumerate_alternatives_enabled: boolean;
+  amount_control_totals_enabled: boolean;
+  match_type_distribution_enabled: boolean;
+  pan_detection_enabled: boolean;
+  large_batch_mode_enabled: boolean;
+  max_sap_rows_per_run: number;
+  // Workflow & Compliance (Phase 4)
+  approval_workflow_enabled: boolean;
+  comment_threads_enabled: boolean;
+  reviewer_assignment_enabled: boolean;
+  bulk_operations_enabled: boolean;
+  run_archival_enabled: boolean;
+  archival_retention_days: number;
+  compliance_report_enabled: boolean;
+  data_quality_precheck_enabled: boolean;
+  custom_exception_rules_enabled: boolean;
+  run_comparison_enabled: boolean;
+  enhanced_webhook_enabled: boolean;
+  webhook_retry_count: number;
+  webhook_secret: string | null;
+  // Advanced Tuning & Profiles (Phase 5)
+  high_value_threshold: number;
+  auto_escalate_high_value: boolean;
+  force_match_exception_severity: string;
+  score_weight_variance: number;
+  score_weight_date: number;
+  score_weight_section: number;
+  score_weight_clearing: number;
+  score_weight_historical: number;
+  custom_scoring_enabled: boolean;
+  variance_ceiling_single_pct: number;
+  variance_ceiling_combo_pct: number;
+  variance_ceiling_force_single_pct: number;
+  variance_ceiling_force_combo_pct: number;
+  custom_variance_ceilings_enabled: boolean;
+  combo_iteration_budget: number;
+  combo_pool_cap: number;
+  combo_date_window_days: number;
+  date_proximity_profile: string;
+  filing_lag_days_tolerance: number;
+  clearing_doc_bonus_score: number;
+  proxy_clearing_date_window_days: number;
+  rate_tolerance_pct: number;
+  rate_mismatch_severity: string;
+  parser_lenient_mode: boolean;
+  cleaner_duplicate_strategy: string;
+  export_show_score_breakdown: boolean;
+  export_template_active: string;
+  dashboard_match_rate_target_pct: number;
+  dashboard_variance_warning_pct: number;
+  dashboard_exclude_failed_from_trends: boolean;
+  // Reporting, Intelligence & Safety (Phase 6)
+  confidence_high_variance_threshold: number;
+  confidence_medium_variance_threshold: number;
+  confidence_score_boost_threshold: number;
+  exact_tolerance_rupees: number;
+  auto_approval_enabled: boolean;
+  auto_approval_min_match_rate: number;
+  auto_approval_max_exceptions: number;
+  high_confidence_sections: string;
+  section_confidence_boost_pct: number;
+  unmatched_alerting_enabled: boolean;
+  unmatched_critical_amount_threshold: number;
+  unmatched_critical_count_threshold: number;
+  force_match_alert_enabled: boolean;
+  force_match_alert_pct_threshold: number;
+  audit_log_retention_enabled: boolean;
+  audit_log_retention_days: number;
+  audit_log_redact_amounts: boolean;
+  excel_include_match_distribution: boolean;
+  excel_include_control_totals: boolean;
+  excel_include_variance_analysis: boolean;
+  run_detail_default_sort: string;
+  run_detail_items_per_page: number;
+  run_detail_show_score_columns: boolean;
+  batch_hide_zero_match_parties: boolean;
+  batch_summary_sort_by: string;
+  batch_trend_window_days: number;
+  // Phase 7: Security, Governance & Data Controls
+  session_inactivity_timeout_min: number;
+  max_concurrent_sessions: number;
+  force_reauth_on_approve: boolean;
+  password_min_length: number;
+  password_require_mixed_case: boolean;
+  password_require_number: boolean;
+  password_expiry_days: number;
+  max_failed_login_attempts: number;
+  login_lockout_duration_min: number;
+  notify_admin_on_lockout: boolean;
+  run_retention_days: number;
+  auto_archive_after_days: number;
+  purge_exports_after_days: number;
+  export_watermark_enabled: boolean;
+  export_watermark_text: string;
+  export_require_approval: boolean;
+  redact_tan_in_logs: boolean;
+  redact_pan_in_exports: boolean;
+  mask_amounts_in_preview: boolean;
+  max_upload_size_mb: number;
+  max_rows_per_file: number;
+  reject_empty_columns: boolean;
+  anomaly_detection_enabled: boolean;
+  amount_outlier_stddev: number;
+  match_rate_drop_alert_pct: number;
+  batch_retry_backoff_seconds: number;
+  batch_stop_on_failure_count: number;
+  batch_partial_resume_enabled: boolean;
+  system_alerts_enabled: boolean;
+  slow_run_threshold_seconds: number;
+  high_exception_rate_pct: number;
   updated_at: string | null;
 }
 
@@ -407,6 +545,37 @@ export interface SuggestedSummary {
   authorized: number;
   rejected: number;
   pending: number;
+}
+
+// ── Comments (Phase 4B) ──────────────────────────────────────────────────
+
+export interface RunComment {
+  id: string;
+  run_id: string;
+  user_id: string;
+  user_name: string;
+  user_role: string | null;
+  content: string;
+  parent_id: string | null;
+  context_type: string | null;
+  context_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+// ── Custom Exception Rules (Phase 4H) ────────────────────────────────────
+
+export interface ExceptionRule {
+  id: string;
+  name: string;
+  description: string | null;
+  field: string;
+  operator: string;
+  value: string;
+  severity: string;
+  is_active: boolean;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 // ── Progress Tracking ──────────────────────────────────────────────────────
@@ -678,7 +847,7 @@ export const runsApi = {
     apiClient.post<{ status: string; run_id: string }>(`/api/runs/${id}/cancel`).then((r) => r.data),
 
   rerun: (id: string) =>
-    apiClient.post<{ run_id: string; run_number: number; status: string; original_run_id: string }>(
+    apiClient.post<{ run_id: string; run_number: number; status: string }>(
       `/api/runs/${id}/rerun`,
     ).then((r) => r.data),
 
@@ -708,11 +877,201 @@ export const runsApi = {
 
   batchAuthorizeAllSuggested: (batchId: string, remarks?: string) =>
     apiClient
-      .post<{ success_count: number; promoted_count: number; skipped_requires_remarks: number; runs_affected: number }>(
+      .post<{ success_count: number; promoted_count: number; skipped_requires_remarks: number; skipped_invoice_reuse: number; runs_affected: number }>(
         `/api/runs/batch/${batchId}/suggested/authorize-all`,
         remarks ? { remarks } : {},
       )
       .then((r) => r.data),
+
+  batchUpdateMetadata: (batchId: string, data: { batch_name?: string; batch_tags?: string[] }) =>
+    apiClient.patch(`/api/runs/batch/${batchId}/metadata`, data).then((r) => r.data),
+
+  batchProgress: (batchId: string) =>
+    apiClient.get<{
+      batch_id: string;
+      total_runs: number;
+      overall_pct: number;
+      is_complete: boolean;
+      statuses: Record<string, number>;
+      completed: number;
+      failed: number;
+      processing: number;
+      runs: Array<{
+        run_id: string;
+        run_number: number;
+        deductor_name: string | null;
+        sap_filename: string;
+        status: string;
+        stage: string;
+        progress_pct: number;
+        match_rate_pct: number | null;
+      }>;
+    }>(`/api/runs/batch/${batchId}/progress`).then((r) => r.data),
+
+  trends: (params?: { deductor_name?: string; financial_year?: string; limit?: number }) =>
+    apiClient.get<{
+      data_points: Array<{
+        run_id: string; run_number: number; deductor_name: string | null;
+        financial_year: string; batch_id: string | null;
+        match_rate_pct: number; matched_count: number; suggested_count: number;
+        unmatched_26as_count: number; total_26as_entries: number;
+        constraint_violations: number; created_at: string | null;
+      }>;
+      count: number;
+      avg_match_rate: number | null;
+      min_match_rate: number | null;
+      max_match_rate: number | null;
+      trend_direction: 'improving' | 'declining' | 'stable';
+    }>('/api/runs/trends', { params }).then((r) => r.data),
+
+  batchCompare: (batchId: string) =>
+    apiClient.get<{
+      batch_id: string;
+      parent_batch_id: string | null;
+      has_parent: boolean;
+      parties: Array<{
+        current: {
+          run_id: string; run_number: number; deductor_name: string | null;
+          match_rate_pct: number; matched_count: number; suggested_count: number;
+          unmatched_26as_count: number; constraint_violations: number;
+        };
+        parent: {
+          run_id: string; run_number: number; match_rate_pct: number;
+          matched_count: number; suggested_count: number;
+          unmatched_26as_count: number; constraint_violations: number;
+        } | null;
+        delta: {
+          match_rate_pct: number; matched_count: number; suggested_count: number;
+          unmatched_26as_count: number; constraint_violations: number;
+        } | null;
+      }>;
+    }>(`/api/runs/batch/${batchId}/compare`).then((r) => r.data),
+
+  batchAnalytics: (batchId: string) =>
+    apiClient.get<{
+      batch_id: string;
+      total_parties: number;
+      completed_parties: number;
+      confidence_distribution: Record<string, number>;
+      match_type_breakdown: Record<string, number>;
+      section_heatmap: Record<string, number>;
+      financial_waterfall: { total_26as: number; matched: number; suggested: number; unmatched: number };
+      risk_matrix: Array<{
+        run_id: string;
+        deductor_name: string;
+        match_rate_pct: number;
+        violations: number;
+        unmatched_count: number;
+        unmatched_amount: number;
+        low_confidence_count: number;
+        has_pan_issues: boolean;
+        control_total_balanced: boolean;
+        risk_score: number;
+      }>;
+    }>(`/api/runs/batch/${batchId}/analytics`).then((r) => r.data),
+
+  checkDuplicates: (sapFiles: File[]) => {
+    const form = new FormData();
+    sapFiles.forEach((f) => form.append('sap_files', f));
+    return apiClient
+      .post<{
+        enabled: boolean;
+        duplicates: Array<{
+          sap_filename: string;
+          sap_file_hash: string;
+          prior_runs: Array<{
+            run_id: string;
+            run_number: number;
+            batch_id: string | null;
+            deductor_name: string | null;
+            financial_year: string;
+            status: string;
+            match_rate_pct: number;
+            created_at: string | null;
+            sap_filename: string;
+          }>;
+        }>;
+      }>('/api/runs/batch/check-duplicates', form)
+      .then((r) => r.data);
+  },
+
+  batchSchedule: (batchId: string, scheduledAt: string) =>
+    apiClient.post<{
+      batch_id: string; scheduled_at: string; status: string; delay_seconds: number;
+    }>(`/api/runs/batch/${batchId}/schedule`, { scheduled_at: scheduledAt }).then((r) => r.data),
+
+  batchScheduleStatus: (batchId: string) =>
+    apiClient.get<{
+      batch_id: string; scheduled: boolean; scheduled_at?: string; status?: string; delay_seconds?: number;
+    }>(`/api/runs/batch/${batchId}/schedule`).then((r) => r.data),
+
+  batchScheduleCancel: (batchId: string) =>
+    apiClient.delete<{ batch_id: string; status: string }>(`/api/runs/batch/${batchId}/schedule`).then((r) => r.data),
+
+  configDiff: (runId: string) =>
+    apiClient.get<{
+      run_id: string;
+      parent_id: string | null;
+      has_parent: boolean;
+      diff: Array<{ field: string; old_value: unknown; new_value: unknown }>;
+      current_config: Record<string, unknown>;
+      parent_config?: Record<string, unknown>;
+    }>(`/api/runs/${runId}/config-diff`).then((r) => r.data),
+
+  // ── Comments (Phase 4B) ──────────────────────────────────────────────────
+  comments: (runId: string) =>
+    apiClient.get<RunComment[]>(`/api/runs/${runId}/comments`).then((r) => r.data),
+
+  addComment: (runId: string, content: string, parentId?: string, contextType?: string, contextId?: string) =>
+    apiClient.post<RunComment>(`/api/runs/${runId}/comments`, {
+      content, parent_id: parentId, context_type: contextType, context_id: contextId,
+    }).then((r) => r.data),
+
+  updateComment: (runId: string, commentId: string, content: string) =>
+    apiClient.put<RunComment>(`/api/runs/${runId}/comments/${commentId}`, { content }).then((r) => r.data),
+
+  deleteComment: (runId: string, commentId: string) =>
+    apiClient.delete(`/api/runs/${runId}/comments/${commentId}`).then((r) => r.data),
+
+  // ── Reviewer Assignment (Phase 4C) ────────────────────────────────────────
+  assignReviewer: (runId: string, reviewerId: string | null) =>
+    apiClient.post<{ status: string; assigned_reviewer_id: string | null }>(
+      `/api/runs/${runId}/assign-reviewer`, { reviewer_id: reviewerId },
+    ).then((r) => r.data),
+
+  // ── Bulk Operations (Phase 4D) ────────────────────────────────────────────
+  bulkReview: (runIds: string[], action: 'APPROVED' | 'REJECTED', notes?: string) =>
+    apiClient.post<{ success: number; failed: number; errors: Array<{ run_id: string; error: string }> }>(
+      '/api/runs/bulk/review', { run_ids: runIds, action, notes },
+    ).then((r) => r.data),
+
+  bulkArchive: (runIds: string[]) =>
+    apiClient.post<{ archived: number }>('/api/runs/bulk/archive', { run_ids: runIds }).then((r) => r.data),
+
+  // ── Archival (Phase 4E) ──────────────────────────────────────────────────
+  archiveRun: (runId: string) =>
+    apiClient.post<{ status: string; archived: boolean }>(`/api/runs/${runId}/archive`).then((r) => r.data),
+
+  // ── Run Comparison (Phase 4I) ──────────────────────────────────────────────
+  compareRuns: (runIdA: string, runIdB: string) =>
+    apiClient.get<{
+      run_a: Record<string, unknown>;
+      run_b: Record<string, unknown>;
+      diffs: Array<{ field: string; run_a_value: unknown; run_b_value: unknown; delta: number | null }>;
+      same_deductor: boolean;
+      same_fy: boolean;
+    }>(`/api/runs/compare/${runIdA}/${runIdB}`).then((r) => r.data),
+
+  // ── Compliance Report (Phase 4F) ─────────────────────────────────────────
+  downloadComplianceReport: (runId: string) =>
+    apiClient.get(`/api/runs/${runId}/compliance-report`, { responseType: 'blob' }).then((r) => {
+      const url = URL.createObjectURL(new Blob([r.data]));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Compliance_Report_${runId}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }),
 };
 
 // ── Misc APIs ─────────────────────────────────────────────────────────────────
@@ -735,4 +1094,17 @@ export const settingsApi = {
 
   history: () =>
     apiClient.get<AdminSettings[]>('/api/settings/history').then((r) => r.data),
+
+  // ── Custom Exception Rules (Phase 4H) ────────────────────────────────────
+  listExceptionRules: () =>
+    apiClient.get<ExceptionRule[]>('/api/settings/exception-rules').then((r) => r.data),
+
+  createExceptionRule: (data: { name: string; description?: string; field: string; operator: string; value: string; severity?: string }) =>
+    apiClient.post<ExceptionRule>('/api/settings/exception-rules', data).then((r) => r.data),
+
+  updateExceptionRule: (id: string, data: Partial<ExceptionRule>) =>
+    apiClient.put<ExceptionRule>(`/api/settings/exception-rules/${id}`, data).then((r) => r.data),
+
+  deleteExceptionRule: (id: string) =>
+    apiClient.delete(`/api/settings/exception-rules/${id}`).then((r) => r.data),
 };

@@ -60,6 +60,9 @@ def score_candidate(
     sap_section_map: Optional[dict] = None,   # future: invoice_ref → section
     historical_score: float = 5.0,            # default neutral
     enforce_before: bool = True,              # penalise books after 26AS date
+    weights: Optional[dict] = None,           # Phase 5B: custom scoring weights
+    clearing_doc_bonus: Optional[float] = None,  # Phase 5F: clearing doc bonus score
+    section_boost_config: Optional[dict] = None,  # Phase 6D: {sections: set, boost_pct: float}
 ) -> ScoreBreakdown:
     """
     Compute composite score for one candidate match.
@@ -72,28 +75,38 @@ def score_candidate(
         sap_section_map: Optional dict mapping invoice_ref → expected section
         historical_score: 0–10 from historical pattern (default 5 = neutral)
         enforce_before: If True, heavily penalise books dated after 26AS date
+        weights: Optional dict with keys variance/date/section/clearing/historical (values: pct points)
+        clearing_doc_bonus: Optional custom bonus score when clearing doc present (0-100 raw)
 
     Returns:
         ScoreBreakdown with total and component scores
     """
-    # ── 1. Variance Score (30%) ───────────────────────────────────────────────
+    # Resolve weights: custom or default (30/20/20/20/10)
+    w_var = (weights.get("variance", 30.0) if weights else 30.0) / 100.0
+    w_date = (weights.get("date", 20.0) if weights else 20.0) / 100.0
+    w_sec = (weights.get("section", 20.0) if weights else 20.0) / 100.0
+    w_clr = (weights.get("clearing", 20.0) if weights else 20.0) / 100.0
+    w_hist = (weights.get("historical", 10.0) if weights else 10.0) / 100.0
+
+    # ── 1. Variance Score ────────────────────────────────────────────────────
     if as26_amount > 0:
         variance_pct = abs(as26_amount - candidate.total) / as26_amount * 100
     else:
         variance_pct = 100.0
-    variance_score = _score_variance(variance_pct) * 0.30
+    variance_score = _score_variance(variance_pct) * w_var
 
-    # ── 2. Date Proximity Score (20%) ─────────────────────────────────────────
-    date_score = _score_date_proximity(as26_date, candidate.dates, enforce_before=enforce_before) * 0.20
+    # ── 2. Date Proximity Score ──────────────────────────────────────────────
+    date_score = _score_date_proximity(as26_date, candidate.dates, enforce_before=enforce_before) * w_date
 
-    # ── 3. Section Match Score (20%) ──────────────────────────────────────────
-    section_score = _score_section(as26_section, candidate.invoice_refs, sap_section_map) * 0.20
+    # ── 3. Section Match Score ───────────────────────────────────────────────
+    section_score = _score_section(as26_section, candidate.invoice_refs, sap_section_map, section_boost_config=section_boost_config) * w_sec
 
-    # ── 4. Clearing Doc Linkage Score (20%) ──────────────────────────────────
-    clearing_score = _score_clearing_doc(candidate.clearing_doc) * 0.20
+    # ── 4. Clearing Doc Linkage Score ────────────────────────────────────────
+    clearing_raw = _score_clearing_doc(candidate.clearing_doc, bonus=clearing_doc_bonus)
+    clearing_score = clearing_raw * w_clr
 
-    # ── 5. Historical Pattern Score (10%) ────────────────────────────────────
-    hist_score = min(max(historical_score, 0.0), 10.0) * 0.10
+    # ── 5. Historical Pattern Score ──────────────────────────────────────────
+    hist_score = min(max(historical_score, 0.0), 10.0) * w_hist
 
     total = variance_score + date_score + section_score + clearing_score + hist_score
 
@@ -185,6 +198,7 @@ def _score_section(
     as26_section: str,
     invoice_refs: List[str],
     sap_section_map: Optional[dict],
+    section_boost_config: Optional[dict] = None,
 ) -> float:
     """
     0–100 score for section alignment.
@@ -208,22 +222,28 @@ def _score_section(
             return (matches / total) * 100.0
 
     # Without SAP section map: give slight boost for well-known high-volume sections
-    # These sections (194C, 194J, 194H) have standard TDS rates, less ambiguity
-    HIGH_CONFIDENCE_SECTIONS = {"194C", "194J", "194H", "194I", "194A"}
-    if as26_section.strip() in HIGH_CONFIDENCE_SECTIONS:
-        return 60.0  # slight positive bias for standard sections
+    # Phase 6D: configurable sections and boost percentage
+    if section_boost_config:
+        high_sections = section_boost_config.get("sections", {"194C", "194J", "194H", "194I", "194A"})
+        boost_pct = section_boost_config.get("boost_pct", 60.0)
+    else:
+        high_sections = {"194C", "194J", "194H", "194I", "194A"}
+        boost_pct = 60.0
+    if as26_section.strip() in high_sections:
+        return boost_pct
 
     return 50.0  # neutral
 
 
-def _score_clearing_doc(clearing_doc: Optional[str]) -> float:
+def _score_clearing_doc(clearing_doc: Optional[str], bonus: Optional[float] = None) -> float:
     """
     0–100 score for clearing document linkage.
-    Present and non-empty → 100 (strong business linkage evidence)
+    Present and non-empty → bonus (default 100, configurable via Phase 5F)
     Absent → 20 (possible but weaker)
     """
+    present_score = bonus if bonus is not None else 100.0
     if clearing_doc and str(clearing_doc).strip() not in ("", "0", "None"):
-        return 100.0
+        return min(present_score, 100.0)
     return 20.0
 
 

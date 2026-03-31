@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, MappedColumn
-from sqlalchemy import MetaData, text
+from sqlalchemy import MetaData, text, event
 
 from core.settings import settings
 
@@ -37,6 +37,15 @@ engine = create_async_engine(
     connect_args=connect_args,
     pool_pre_ping=True,
 )
+
+# Set PRAGMA busy_timeout + WAL on every new SQLite connection (not just startup)
+if _is_sqlite:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+        cursor.close()
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

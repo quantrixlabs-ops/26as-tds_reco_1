@@ -59,6 +59,21 @@ from db.models import (
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+# ── Phase 7B: Admin-configurable password policy loader ──────────────────────
+
+async def _validate_password_with_policy(password: str, db: AsyncSession):
+    """Load password rules from AdminSettings and validate."""
+    from db.models import AdminSettings
+    result = await db.execute(select(AdminSettings).where(AdminSettings.is_active == True))
+    s = result.scalar_one_or_none()
+    return validate_password(
+        password,
+        min_length=getattr(s, 'password_min_length', None),
+        require_mixed_case=getattr(s, 'password_require_mixed_case', None),
+        require_number=getattr(s, 'password_require_number', None),
+    )
+
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class SecurityQuestionInput(BaseModel):
@@ -191,7 +206,7 @@ async def register(
         raise HTTPException(status_code=403, detail="Self-registration is disabled. Contact an administrator.")
 
     # Validate password strength
-    pw_result = validate_password(body.password)
+    pw_result = await _validate_password_with_policy(body.password, db)
     if not pw_result.valid:
         raise HTTPException(status_code=400, detail={"message": "Password too weak", "errors": pw_result.errors})
 
@@ -263,7 +278,7 @@ async def admin_create_user(
     current_user: User = Depends(require_admin),
 ):
     """Admin-only: create user with any role, auto-verified."""
-    pw_result = validate_password(body.password)
+    pw_result = await _validate_password_with_policy(body.password, db)
     if not pw_result.valid:
         raise HTTPException(status_code=400, detail={"message": "Password too weak", "errors": pw_result.errors})
 
@@ -376,16 +391,27 @@ async def login(
     """
     check_login_rate(request)
 
+    # Phase 7C: Load configurable login protection from AdminSettings
+    from db.models import AdminSettings
+    _adm_r = await db.execute(select(AdminSettings).where(AdminSettings.is_active == True))
+    _adm = _adm_r.scalar_one_or_none()
+    _max_attempts = getattr(_adm, 'max_failed_login_attempts', None) or settings.MAX_LOGIN_ATTEMPTS
+    _lockout_min = getattr(_adm, 'login_lockout_duration_min', None) or settings.LOCKOUT_DURATION_MINUTES
+    _notify_lockout = getattr(_adm, 'notify_admin_on_lockout', False)
+
     # Check account lockout
     if rate_limiter.is_account_locked(
         body.email,
-        max_failures=settings.MAX_LOGIN_ATTEMPTS,
-        lock_seconds=settings.LOCKOUT_DURATION_MINUTES * 60,
+        max_failures=_max_attempts,
+        lock_seconds=_lockout_min * 60,
     ):
         await _log_login_attempt(db, body.email, request, success=False, failure_reason="ACCOUNT_LOCKED")
+        if _notify_lockout:
+            await log_event(db, "ACCOUNT_LOCKOUT", f"Account locked: {body.email} after {_max_attempts} failed attempts",
+                            ip_address=get_client_ip(request))
         raise HTTPException(
             status_code=423,
-            detail=f"Account temporarily locked due to too many failed attempts. Try again in {settings.LOCKOUT_DURATION_MINUTES} minutes."
+            detail=f"Account temporarily locked due to too many failed attempts. Try again in {_lockout_min} minutes."
         )
 
     result = await db.execute(select(User).where(User.email == body.email, User.is_active == True))
@@ -517,7 +543,7 @@ async def reset_password(
     Token is invalidated after use.
     """
     # Validate new password strength
-    pw_result = validate_password(body.new_password)
+    pw_result = await _validate_password_with_policy(body.new_password, db)
     if not pw_result.valid:
         raise HTTPException(status_code=400, detail={"message": "Password too weak", "errors": pw_result.errors})
 
@@ -632,9 +658,9 @@ async def get_security_questions(
 # ── Password Strength Check ──────────────────────────────────────────────────
 
 @router.post("/password-strength", response_model=PasswordStrengthResponse)
-async def check_password_strength(body: PasswordStrengthRequest):
+async def check_password_strength(body: PasswordStrengthRequest, db: AsyncSession = Depends(get_db)):
     """Real-time password strength checker (no auth required)."""
-    result = validate_password(body.password)
+    result = await _validate_password_with_policy(body.password, db)
     return PasswordStrengthResponse(
         strength=result.strength,
         strength_label=result.strength_label,
@@ -748,7 +774,7 @@ async def setup_first_admin(body: RegisterRequest, request: Request, db: AsyncSe
         raise HTTPException(status_code=403, detail="Admin already exists. Use /register via admin account.")
 
     # Validate password
-    pw_result = validate_password(body.password)
+    pw_result = await _validate_password_with_policy(body.password, db)
     if not pw_result.valid:
         raise HTTPException(status_code=400, detail={"message": "Password too weak", "errors": pw_result.errors})
 
